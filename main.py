@@ -326,7 +326,8 @@ async def store_articles(articles):
 
 async def query_articles_with_sentiment(company=None, hours=24, page=1, limit=50):
     """
-    Query articles. If company specified, also run sentiment on unseen articles.
+    Query articles. If company specified, also run sentiment on the
+    EXACT articles being returned (not random ones).
     Returns (articles, total, sentiment_count).
     """
     coll = db[COLLECTION]
@@ -338,44 +339,51 @@ async def query_articles_with_sentiment(company=None, hours=24, page=1, limit=50
 
     total = await coll.count_documents(q)
 
-    # ── If company search: find articles WITHOUT sentiment and analyze them ──
-    sentiment_count = 0
-    if company and HF_TOKEN:
-        # Find articles matching this company that have no sentiment
-        no_sentiment_q = dict(q)
-        no_sentiment_q["sentiment"] = None
-
-        cursor = coll.find(
-            no_sentiment_q,
-            {"_id": 1, "title": 1, "description": 1},
-        ).limit(100)  # cap at 100 per request to avoid HF rate limits
-
-        to_analyze = []
-        async for doc in cursor:
-            text = f"{doc.get('title', '')}. {doc.get('description', '')}"
-            text = text.strip()
-            if len(text) > 5:
-                to_analyze.append((doc["_id"], text))
-
-        if to_analyze:
-            sentiment_count = await run_sentiment_for_articles(to_analyze)
-
-    # ── Now fetch paginated results (with sentiment if available) ──
+    # Step 1: Fetch the paginated articles (with _id for updating)
     skip = (page - 1) * limit
     cursor = coll.find(
         q,
-        {"_id": 0, "title": 1, "description": 1, "source": 1,
+        {"title": 1, "description": 1, "source": 1,
          "published_ist": 1, "link": 1, "sentiment": 1},
     ).sort([("published_dt", -1), ("fetched_at", -1)]).skip(skip).limit(limit)
 
-    results = []
+    articles = []
     async for doc in cursor:
-        # Clean up: don't send null sentiment for general queries
+        articles.append(doc)
+
+    # Step 2: If company search, find articles in THIS page without sentiment
+    sentiment_count = 0
+    if company and HF_TOKEN and articles:
+        to_analyze = []
+        for doc in articles:
+            if doc.get("sentiment") is None:
+                text = f"{doc.get('title', '')}. {doc.get('description', '')}"
+                text = text.strip()
+                if len(text) > 5:
+                    to_analyze.append((doc["_id"], text))
+
+        # Step 3: Run FinBERT on those specific articles
+        if to_analyze:
+            sentiment_count = await run_sentiment_for_articles(to_analyze)
+
+            # Step 4: Re-fetch the same articles to get updated sentiment
+            article_ids = [doc["_id"] for doc in articles]
+            cursor2 = coll.find(
+                {"_id": {"$in": article_ids}},
+                {"title": 1, "description": 1, "source": 1,
+                 "published_ist": 1, "link": 1, "sentiment": 1},
+            ).sort([("published_dt", -1), ("fetched_at", -1)])
+            articles = [doc async for doc in cursor2]
+
+    # Step 5: Clean output — remove _id, remove null sentiment for general queries
+    cleaned = []
+    for doc in articles:
+        doc.pop("_id", None)
         if not company and doc.get("sentiment") is None:
             doc.pop("sentiment", None)
-        results.append(doc)
+        cleaned.append(doc)
 
-    return results, total, sentiment_count
+    return cleaned, total, sentiment_count
 
 
 # ═══════════════════════════════════════════════════
