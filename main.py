@@ -49,7 +49,6 @@ MAX_CONCURRENT     = 80
 # ProsusAI/finbert is the standard financial sentiment model
 # Labels: positive, negative, neutral
 HF_MODEL_URL = "https://router.huggingface.co/hf-inference/models/ProsusAI/finbert"
-SENTIMENT_BATCH_SIZE = 10  # HF API batch limit
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -214,46 +213,36 @@ async def fetch_parallel(feeds, session):
 # Only runs for company-specific searches
 # Results cached in MongoDB — never re-analyzed
 # ═══════════════════════════════════════════════════
-async def analyze_sentiment_batch(texts: list[str]) -> list[dict]:
+async def analyze_sentiments(titles: list[str]) -> list[Optional[dict]]:
     """
-    Send texts to FinBERT via HF API.
+    Send ALL titles to FinBERT in ONE API call.
+    Titles are short (~50-100 chars) so batch always works.
     Returns list of {"label": "positive/negative/neutral", "score": 0.95}
     """
-    if not HF_TOKEN:
-        log.warning("HF_TOKEN not set — skipping sentiment analysis")
-        return [None] * len(texts)
-
-    if not texts:
-        return []
+    if not HF_TOKEN or not titles:
+        return [None] * len(titles)
 
     headers = {
         "Authorization": f"Bearer {HF_TOKEN}",
         "Content-Type": "application/json",
     }
 
-    # Truncate texts for FinBERT (max 512 tokens ≈ 300 chars)
-    truncated = [t[:300] for t in texts]
-
     try:
         async with http_session.post(
             HF_MODEL_URL,
             headers=headers,
-            json={"inputs": truncated},
+            json={"inputs": titles},
             timeout=aiohttp.ClientTimeout(total=30),
         ) as resp:
             if resp.status != 200:
-                error_body = await resp.text()
-                log.warning(f"HF API error {resp.status}: {error_body[:200]}")
-                return [None] * len(texts)
+                log.warning(f"HF API {resp.status}: {(await resp.text())[:200]}")
+                return [None] * len(titles)
 
             results = await resp.json()
 
-            # HF returns: [[{label, score}, {label, score}, ...], ...]
-            # We want the top label for each input
             sentiments = []
             for result in results:
                 if isinstance(result, list) and result:
-                    # Sort by score descending, pick top
                     top = max(result, key=lambda x: x.get("score", 0))
                     sentiments.append({
                         "label": top["label"],
@@ -261,44 +250,11 @@ async def analyze_sentiment_batch(texts: list[str]) -> list[dict]:
                     })
                 else:
                     sentiments.append(None)
-
             return sentiments
 
     except Exception as e:
-        log.warning(f"HF API call failed: {e}")
-        return [None] * len(texts)
-
-
-async def run_sentiment_for_articles(article_ids_and_texts: list[tuple]) -> int:
-    """
-    Run FinBERT on articles that don't have sentiment yet.
-    Updates MongoDB in place. Returns count of newly analyzed.
-    """
-    if not article_ids_and_texts:
-        return 0
-
-    coll = db[COLLECTION]
-    total_analyzed = 0
-
-    # Process in batches of SENTIMENT_BATCH_SIZE
-    for i in range(0, len(article_ids_and_texts), SENTIMENT_BATCH_SIZE):
-        batch = article_ids_and_texts[i:i + SENTIMENT_BATCH_SIZE]
-        ids = [item[0] for item in batch]
-        texts = [item[1] for item in batch]
-
-        sentiments = await analyze_sentiment_batch(texts)
-
-        # Update each article in MongoDB
-        for doc_id, sentiment in zip(ids, sentiments):
-            if sentiment:
-                await coll.update_one(
-                    {"_id": doc_id},
-                    {"$set": {"sentiment": sentiment}},
-                )
-                total_analyzed += 1
-
-    log.info(f"Sentiment analyzed: {total_analyzed} articles")
-    return total_analyzed
+        log.warning(f"HF API failed: {e}")
+        return [None] * len(titles)
 
 
 # ═══════════════════════════════════════════════════
@@ -354,26 +310,29 @@ async def query_articles_with_sentiment(company=None, hours=24, page=1, limit=50
     # Step 2: If company search, find articles in THIS page without sentiment
     sentiment_count = 0
     if company and HF_TOKEN and articles:
-        to_analyze = []
+        # Collect articles that need sentiment
+        need_sentiment = []
         for doc in articles:
             if doc.get("sentiment") is None:
-                text = f"{doc.get('title', '')}. {doc.get('description', '')}"
-                text = text.strip()
-                if len(text) > 5:
-                    to_analyze.append((doc["_id"], text))
+                need_sentiment.append(doc)
 
-        # Step 3: Run FinBERT on those specific articles
-        if to_analyze:
-            sentiment_count = await run_sentiment_for_articles(to_analyze)
+        if need_sentiment:
+            # ONE API call with all titles
+            titles = [doc.get("title", "")[:150] for doc in need_sentiment]
+            sentiments = await analyze_sentiments(titles)
 
-            # Step 4: Re-fetch the same articles to get updated sentiment
-            article_ids = [doc["_id"] for doc in articles]
-            cursor2 = coll.find(
-                {"_id": {"$in": article_ids}},
-                {"title": 1, "description": 1, "source": 1,
-                 "published_ist": 1, "link": 1, "sentiment": 1},
-            ).sort([("published_dt", -1), ("fetched_at", -1)])
-            articles = [doc async for doc in cursor2]
+            # Update MongoDB + in-memory docs
+            coll = db[COLLECTION]
+            for doc, sentiment in zip(need_sentiment, sentiments):
+                if sentiment:
+                    await coll.update_one(
+                        {"_id": doc["_id"]},
+                        {"$set": {"sentiment": sentiment}},
+                    )
+                    doc["sentiment"] = sentiment
+                    sentiment_count += 1
+
+            log.info(f"Sentiment: {sentiment_count}/{len(need_sentiment)} via title-only batch")
 
     # Step 5: Clean output — remove _id, remove null sentiment for general queries
     cleaned = []
