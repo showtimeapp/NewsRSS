@@ -213,48 +213,33 @@ async def fetch_parallel(feeds, session):
 # Only runs for company-specific searches
 # Results cached in MongoDB — never re-analyzed
 # ═══════════════════════════════════════════════════
-async def analyze_sentiments(titles: list[str]) -> list[Optional[dict]]:
-    """
-    Send ALL titles to FinBERT in ONE API call.
-    Titles are short (~50-100 chars) so batch always works.
-    Returns list of {"label": "positive/negative/neutral", "score": 0.95}
-    """
-    if not HF_TOKEN or not titles:
-        return [None] * len(titles)
-
+async def analyze_one_title(title: str) -> Optional[dict]:
+    """Analyze ONE title. Returns {"label": "positive", "score": 0.95} or None."""
     headers = {
         "Authorization": f"Bearer {HF_TOKEN}",
         "Content-Type": "application/json",
     }
-
     try:
         async with http_session.post(
             HF_MODEL_URL,
             headers=headers,
-            json={"inputs": titles},
-            timeout=aiohttp.ClientTimeout(total=30),
+            json={"inputs": title},
+            timeout=aiohttp.ClientTimeout(total=15),
         ) as resp:
             if resp.status != 200:
-                log.warning(f"HF API {resp.status}: {(await resp.text())[:200]}")
-                return [None] * len(titles)
-
-            results = await resp.json()
-
-            sentiments = []
-            for result in results:
-                if isinstance(result, list) and result:
-                    top = max(result, key=lambda x: x.get("score", 0))
-                    sentiments.append({
-                        "label": top["label"],
-                        "score": round(top["score"], 4),
-                    })
-                else:
-                    sentiments.append(None)
-            return sentiments
-
+                log.warning(f"HF {resp.status} for: {title[:50]}")
+                return None
+            result = await resp.json()
+            # Single input returns: [[{label,score}, {label,score}, {label,score}]]
+            if isinstance(result, list) and result:
+                scores = result[0] if isinstance(result[0], list) else result
+                if isinstance(scores, list) and scores:
+                    top = max(scores, key=lambda x: x.get("score", 0))
+                    return {"label": top["label"], "score": round(top["score"], 4)}
+            return None
     except Exception as e:
-        log.warning(f"HF API failed: {e}")
-        return [None] * len(titles)
+        log.warning(f"HF error for '{title[:40]}': {e}")
+        return None
 
 
 # ═══════════════════════════════════════════════════
@@ -317,9 +302,10 @@ async def query_articles_with_sentiment(company=None, hours=24, page=1, limit=50
                 need_sentiment.append(doc)
 
         if need_sentiment:
-            # ONE API call with all titles
+            # Fire ALL HF calls at once (concurrent, not sequential)
             titles = [doc.get("title", "")[:150] for doc in need_sentiment]
-            sentiments = await analyze_sentiments(titles)
+            tasks = [analyze_one_title(t) for t in titles]
+            sentiments = await asyncio.gather(*tasks)
 
             # Update MongoDB + in-memory docs
             coll = db[COLLECTION]
@@ -332,7 +318,7 @@ async def query_articles_with_sentiment(company=None, hours=24, page=1, limit=50
                     doc["sentiment"] = sentiment
                     sentiment_count += 1
 
-            log.info(f"Sentiment: {sentiment_count}/{len(need_sentiment)} via title-only batch")
+            log.info(f"Sentiment: {sentiment_count}/{len(need_sentiment)} titles analyzed")
 
     # Step 5: Clean output — remove _id, remove null sentiment for general queries
     cleaned = []
