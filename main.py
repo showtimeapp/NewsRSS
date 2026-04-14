@@ -213,49 +213,76 @@ async def fetch_parallel(feeds, session):
 # Only runs for company-specific searches
 # Results cached in MongoDB — never re-analyzed
 # ═══════════════════════════════════════════════════
+hf_sem = asyncio.Semaphore(3)  # max 3 concurrent HF calls (free tier rate limit)
+
 async def analyze_one_title(title: str) -> Optional[dict]:
-    """Analyze ONE title. Returns {"label": "positive", "score": 0.95} or None."""
+    """Analyze ONE title. Retries once on failure."""
     headers = {
         "Authorization": f"Bearer {HF_TOKEN}",
         "Content-Type": "application/json",
     }
-    try:
-        async with http_session.post(
-            HF_MODEL_URL,
-            headers=headers,
-            json={"inputs": title},
-            timeout=aiohttp.ClientTimeout(total=15),
-        ) as resp:
-            if resp.status != 200:
-                log.warning(f"HF {resp.status} for: {title[:50]}")
+
+    for attempt in range(2):  # try twice
+        async with hf_sem:
+            try:
+                async with http_session.post(
+                    HF_MODEL_URL,
+                    headers=headers,
+                    json={"inputs": title},
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as resp:
+                    if resp.status == 429 or resp.status == 503:
+                        # Rate limited or model loading — wait and retry
+                        await asyncio.sleep(2)
+                        continue
+                    if resp.status != 200:
+                        return None
+                    result = await resp.json()
+                    if isinstance(result, list) and result:
+                        scores = result[0] if isinstance(result[0], list) else result
+                        if isinstance(scores, list) and scores:
+                            top = max(scores, key=lambda x: x.get("score", 0))
+                            return {"label": top["label"], "score": round(top["score"], 4)}
+                    return None
+            except Exception:
+                if attempt == 0:
+                    await asyncio.sleep(1)
+                    continue
                 return None
-            result = await resp.json()
-            # Single input returns: [[{label,score}, {label,score}, {label,score}]]
-            if isinstance(result, list) and result:
-                scores = result[0] if isinstance(result[0], list) else result
-                if isinstance(scores, list) and scores:
-                    top = max(scores, key=lambda x: x.get("score", 0))
-                    return {"label": top["label"], "score": round(top["score"], 4)}
-            return None
-    except Exception as e:
-        log.warning(f"HF error for '{title[:40]}': {e}")
-        return None
+    return None
 
 
 # ═══════════════════════════════════════════════════
 # MONGODB
 # ═══════════════════════════════════════════════════
+import hashlib
+
+def make_dedup_key(title: str) -> str:
+    """Normalize title for dedup. Same headline = same key regardless of source."""
+    norm = re.sub(r"\s+", " ", title.lower().strip())
+    return hashlib.md5(norm.encode()).hexdigest()
+
+
 async def store_articles(articles):
     if not articles: return 0
     coll = db[COLLECTION]
+
+    # Add dedup_key to each article
+    for a in articles:
+        a["dedup_key"] = make_dedup_key(a["title"])
+
+    # Dedup within this batch by title
     seen = set(); unique = []
     for a in articles:
-        if a["link"] not in seen:
-            seen.add(a["link"]); unique.append(a)
+        if a["dedup_key"] not in seen:
+            seen.add(a["dedup_key"]); unique.append(a)
+
+    # Check which titles already exist in DB
     existing = set()
-    async for doc in coll.find({"link": {"$in": list(seen)}}, {"link": 1}):
-        existing.add(doc["link"])
-    new = [a for a in unique if a["link"] not in existing]
+    async for doc in coll.find({"dedup_key": {"$in": list(seen)}}, {"dedup_key": 1}):
+        existing.add(doc["dedup_key"])
+
+    new = [a for a in unique if a["dedup_key"] not in existing]
     if not new: return 0
     try:
         r = await coll.insert_many(new, ordered=False)
@@ -361,7 +388,13 @@ async def lifespan(app: FastAPI):
     global db, http_session
     client = AsyncIOMotorClient(MONGO_URI)
     db = client[DB_NAME]
-    await db[COLLECTION].create_index("link", unique=True, background=True)
+    # Drop old unique index on link (replaced by dedup_key)
+    try:
+        await db[COLLECTION].drop_index("link_1")
+    except Exception:
+        pass  # doesn't exist, fine
+    await db[COLLECTION].create_index("dedup_key", unique=True, background=True)
+    await db[COLLECTION].create_index("link", background=True)
     await db[COLLECTION].create_index("fetched_at", background=True)
     await db[COLLECTION].create_index("published_dt", background=True)
     await db[COLLECTION].create_index(
