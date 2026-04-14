@@ -1,0 +1,35 @@
+version: "3.8"
+
+services:
+  mongodb:
+    image: mongo:7
+    container_name: news_mongo
+    restart: always
+    volumes:
+      - mongo_data:/data/db
+    ports:
+      - "27018:27017"   # 27018 external to avoid conflict with other projects
+    networks:
+      - news_network
+
+  newsapi:
+    build: .
+    container_name: news_api
+    restart: always
+    ports:
+      - "8001:8000"     # 8001 external to avoid conflict with other projects
+    env_file:
+      - .env
+    environment:
+      - MONGO_URI=mongodb://mongodb:27017/financial_news
+    depends_on:
+      - mongodb
+    networks:
+      - news_network
+
+volumes:
+  mongo_data:
+
+networks:
+  news_network:
+    driver: bridge
