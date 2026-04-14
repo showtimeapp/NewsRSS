@@ -48,7 +48,7 @@ MAX_CONCURRENT     = 80
 # FinBERT model on HuggingFace Inference API
 # ProsusAI/finbert is the standard financial sentiment model
 # Labels: positive, negative, neutral
-HF_MODEL_URL = "https://api-inference.huggingface.co/models/ProsusAI/finbert"
+HF_MODEL_URL = "https://router.huggingface.co/hf-inference/models/ProsusAI/finbert"
 SENTIMENT_BATCH_SIZE = 10  # HF API batch limit
 
 IST = timezone(timedelta(hours=5, minutes=30))
