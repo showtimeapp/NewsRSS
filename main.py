@@ -292,22 +292,27 @@ async def store_articles(articles):
     return ins
 
 
-async def query_articles_with_sentiment(company=None, hours=24, page=1, limit=50):
+async def query_articles_with_sentiment(companies=None, hours=24, page=1, limit=50):
     """
-    Query articles. If company specified, also run sentiment on the
-    EXACT articles being returned (not random ones).
+    Query articles. If companies specified, filter by ANY of them + run sentiment.
+    companies: list of strings or None
     Returns (articles, total, sentiment_count).
     """
     coll = db[COLLECTION]
-    q = {"published_dt": {"$gte": datetime.now(timezone.utc) - timedelta(hours=hours)}}
+    q = {"published_dt": {"$gte": datetime.now(timezone.utc) - timedelta(hours=hours), "$ne": None}}
 
-    if company:
-        regex = {"$regex": re.escape(company), "$options": "i"}
-        q["$or"] = [{"title": regex}, {"description": regex}]
+    if companies:
+        # Build OR condition: title or description matches ANY company
+        or_conditions = []
+        for c in companies:
+            regex = {"$regex": re.escape(c), "$options": "i"}
+            or_conditions.append({"title": regex})
+            or_conditions.append({"description": regex})
+        q["$or"] = or_conditions
 
     total = await coll.count_documents(q)
 
-    # Step 1: Fetch the paginated articles (with _id for updating)
+    # Step 1: Fetch the paginated articles
     skip = (page - 1) * limit
     cursor = coll.find(
         q,
@@ -319,22 +324,16 @@ async def query_articles_with_sentiment(company=None, hours=24, page=1, limit=50
     async for doc in cursor:
         articles.append(doc)
 
-    # Step 2: If company search, find articles in THIS page without sentiment
+    # Step 2: If company search, run sentiment on articles without it
     sentiment_count = 0
-    if company and HF_TOKEN and articles:
-        # Collect articles that need sentiment
-        need_sentiment = []
-        for doc in articles:
-            if doc.get("sentiment") is None:
-                need_sentiment.append(doc)
+    if companies and HF_TOKEN and articles:
+        need_sentiment = [doc for doc in articles if doc.get("sentiment") is None]
 
         if need_sentiment:
-            # Fire ALL HF calls at once (concurrent, not sequential)
             titles = [doc.get("title", "")[:150] for doc in need_sentiment]
             tasks = [analyze_one_title(t) for t in titles]
             sentiments = await asyncio.gather(*tasks)
 
-            # Update MongoDB + in-memory docs
             coll = db[COLLECTION]
             for doc, sentiment in zip(need_sentiment, sentiments):
                 if sentiment:
@@ -347,11 +346,11 @@ async def query_articles_with_sentiment(company=None, hours=24, page=1, limit=50
 
             log.info(f"Sentiment: {sentiment_count}/{len(need_sentiment)} titles analyzed")
 
-    # Step 5: Clean output — remove _id, remove null sentiment for general queries
+    # Clean output
     cleaned = []
     for doc in articles:
         doc.pop("_id", None)
-        if not company and doc.get("sentiment") is None:
+        if not companies and doc.get("sentiment") is None:
             doc.pop("sentiment", None)
         cleaned.append(doc)
 
@@ -427,7 +426,10 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"],
 
 @app.get("/news")
 async def get_news(
-    company: Optional[str] = Query(None, description="Company name (triggers sentiment analysis)"),
+    company: Optional[str] = Query(
+        None,
+        description="Company name(s), comma-separated. E.g. 'Wipro' or 'HDFC Bank,ICICI,TCS'. Triggers sentiment.",
+    ),
     hours: int = Query(24, ge=1, le=240),
     page: int = Query(1, ge=1),
     limit: int = Query(50, ge=1, le=500),
@@ -435,40 +437,48 @@ async def get_news(
     """
     ## Single endpoint for all news
 
-    **Without company:** Returns general financial news from DB (no sentiment).
-    **With company:** Fetches Google News for company + runs FinBERT sentiment
-    on articles that haven't been analyzed yet. Sentiment is cached forever.
+    **Without company:** Returns general financial news (no sentiment).
+    **With company(s):** Fetches Google News for each company + FinBERT sentiment.
 
-    ### Response article format:
-    ```json
-    {
-      "title": "Wipro Q4: Net profit rises 15%",
-      "description": "IT major Wipro reported...",
-      "source": "Economic Times",
-      "published_ist": "2026-04-14 14:22:00 IST",
-      "link": "https://economictimes.indiatimes.com/...",
-      "sentiment": {"label": "positive", "score": 0.9521}
-    }
+    ### Multi-company examples:
     ```
-    Sentiment is null if not yet analyzed or HF_TOKEN not set.
+    /news?company=Wipro
+    /news?company=HDFC Bank,ICICI,TCS
+    /news?company=Reliance,Infosys,Tata Motors&hours=48&limit=100
+    ```
+
+    All Google News feeds fire in PARALLEL — 3 companies = same latency as 1.
     """
     t = _time.monotonic()
     stale = needs_full()
     cn, fn, sn = 0, 0, 0
 
+    # Parse comma-separated companies
+    companies = None
     if company:
-        ca = await fetch_parallel(get_company_feeds(company), http_session)
-        cn = await store_articles(ca)
-        if stale: fn = await do_full_fetch()
-    else:
-        if stale: fn = await do_full_fetch()
+        companies = [c.strip() for c in company.split(",") if c.strip()]
 
-    articles, total, sn = await query_articles_with_sentiment(company, hours, page, limit)
+    if companies:
+        # Build ALL Google News feeds for ALL companies at once
+        all_company_feeds = []
+        for c in companies:
+            all_company_feeds.extend(get_company_feeds(c))
+
+        # ONE parallel fetch — 3 companies × 3 feeds = 9 feeds, all at once
+        ca = await fetch_parallel(all_company_feeds, http_session)
+        cn = await store_articles(ca)
+        if stale:
+            fn = await do_full_fetch()
+    else:
+        if stale:
+            fn = await do_full_fetch()
+
+    articles, total, sn = await query_articles_with_sentiment(companies, hours, page, limit)
     elapsed = _time.monotonic() - t
 
     return {
         "success": True,
-        "query": {"company": company, "hours": hours, "page": page, "limit": limit},
+        "query": {"company": companies, "hours": hours, "page": page, "limit": limit},
         "meta": {
             "total_results": total,
             "returned": len(articles),
