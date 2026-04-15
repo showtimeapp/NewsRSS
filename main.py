@@ -299,7 +299,7 @@ async def query_articles_with_sentiment(company=None, hours=24, page=1, limit=50
     Returns (articles, total, sentiment_count).
     """
     coll = db[COLLECTION]
-    q = {"fetched_at": {"$gte": datetime.now(timezone.utc) - timedelta(hours=hours)}}
+    q = {"published_dt": {"$gte": datetime.now(timezone.utc) - timedelta(hours=hours)}}
 
     if company:
         regex = {"$regex": re.escape(company), "$options": "i"}
