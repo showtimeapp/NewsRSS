@@ -56,7 +56,7 @@ DB_NAME            = os.getenv("DB_NAME", "financial_news")
 COLLECTION         = "articles"
 FETCH_INTERVAL_MIN = 10
 MIN_FETCH_GAP_MIN  = 5
-FEED_TIMEOUT_SEC   = 8
+FEED_TIMEOUT_SEC   = 12   # was 8; US wire services from GCP Mumbai egress need ~10s headroom
 MAX_CONCURRENT     = 80
 
 IST = timezone(timedelta(hours=5, minutes=30))

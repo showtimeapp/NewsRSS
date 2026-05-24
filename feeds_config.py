@@ -149,8 +149,9 @@ AGGREGATOR_FEEDS = {
         "https://news.google.com/rss/search?q=site:deccanherald.com+OR+site:hindustantimes.com+business&hl=en-IN&gl=IN&ceid=IN:en",
         "https://news.google.com/rss/search?q=site:ndtvprofit.com+OR+site:news18.com+business&hl=en-IN&gl=IN&ceid=IN:en",
 
-        # ── Hindi (1 combined query) ──
-        "https://news.google.com/rss/search?q=शेयर+बाजार+OR+म्यूचुअल+फंड+भारत&hl=hi&gl=IN&ceid=IN:hi",
+        # NOTE: Hindi Google News query was removed — every entry was Devanagari
+        # and got dropped by the is_hindi filter at parse time, so the feed
+        # produced 0 articles every fetch.
     ],
 }
 
