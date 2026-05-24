@@ -57,7 +57,8 @@ COLLECTION         = "articles"
 FETCH_INTERVAL_MIN = 10
 MIN_FETCH_GAP_MIN  = 5
 FEED_TIMEOUT_SEC   = 12   # was 8; US wire services from GCP Mumbai egress need ~10s headroom
-MAX_CONCURRENT     = 80
+MAX_CONCURRENT     = 30   # was 80; smaller pool prevents outbound TLS thundering-herd
+MAX_PER_HOST       = 3    # NEW; was unlimited. Stops 9 Livemint/etc feeds from stampeding one publisher
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -194,8 +195,8 @@ def parse_feed_bytes(raw_bytes, source_name, url):
 # ═══════════════════════════════════════════════════
 # ASYNC FETCHER
 # ═══════════════════════════════════════════════════
-google_sem = asyncio.Semaphore(10)
-general_sem = asyncio.Semaphore(80)
+google_sem = asyncio.Semaphore(6)    # was 10
+general_sem = asyncio.Semaphore(30)  # was 80
 
 
 async def fetch_one(session, source_name, url):
@@ -423,7 +424,12 @@ async def lifespan(app: FastAPI):
     log.info(f"LLM provider chain active: {active_provider()}")
 
     connector = aiohttp.TCPConnector(
-        limit=MAX_CONCURRENT, ttl_dns_cache=300, enable_cleanup_closed=True, ssl=False)
+        limit=MAX_CONCURRENT,
+        limit_per_host=MAX_PER_HOST,
+        ttl_dns_cache=300,
+        enable_cleanup_closed=True,
+        ssl=False,
+    )
     http_session = aiohttp.ClientSession(connector=connector)
 
     await do_full_fetch()
@@ -506,29 +512,26 @@ async def get_news(
     resolve_links: bool = Query(True, description="Resolve google.news redirects"),
     fuzzy: bool = Query(True, description="Collapse near-duplicate titles"),
 ):
+    """
+    Read-only feed query — serves entirely from MongoDB.
+
+    Ingest is decoupled: the 10-min background scheduler is the ONLY thing that
+    fetches RSS feeds. Searches no longer trigger on-demand fetches (which
+    previously caused outbound-connection bursts under load).
+    """
     t = _time.monotonic()
-    stale = needs_full()
-    cn, fn, sn = 0, 0, 0
-
     companies = _parse_companies_csv(company)
-
-    if companies:
-        all_company_feeds = []
-        for c in companies:
-            all_company_feeds.extend(get_company_feeds(c))
-        ca = await fetch_parallel(all_company_feeds, http_session)
-        cn = await store_articles(ca)
-        if stale:
-            fn = await do_full_fetch()
-    else:
-        if stale:
-            fn = await do_full_fetch()
 
     articles, total, sn = await query_articles_with_sentiment(
         companies, sector, hours, page, limit,
         apply_fuzzy_dedup=fuzzy, resolve_links=resolve_links,
     )
     elapsed = _time.monotonic() - t
+
+    # How fresh is the data the user is seeing?
+    age_min = None
+    if last_full_fetch:
+        age_min = int((datetime.now(timezone.utc) - last_full_fetch).total_seconds() / 60)
 
     return {
         "success": True,
@@ -542,10 +545,11 @@ async def get_news(
             "response_time_ms": int(elapsed * 1000),
             "last_full_fetch_ist": last_full_fetch.astimezone(IST).strftime(
                 "%Y-%m-%d %H:%M:%S IST") if last_full_fetch else None,
-            "new_articles": {"company_search": cn, "full_fetch": fn},
+            "data_age_min": age_min,
+            "refresh_interval_min": FETCH_INTERVAL_MIN,
             "sentiment_analyzed_this_request": sn,
             "sentiment_provider": active_provider(),
-            "cache_status": "stale -> fetched" if stale else "fresh -> DB only",
+            "cache_status": "db_only",
         },
         "articles": articles,
     }
