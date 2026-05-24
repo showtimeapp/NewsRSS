@@ -1,232 +1,375 @@
-# Prism Financial News API (v5.0)
+# Prism Financial News API — Integration Guide
 
-A FastAPI service that aggregates **82+ RSS feeds** from 24+ publishers, tags articles by **company** and **sector**, runs **LLM-powered sentiment**, and exposes the data via REST + an **MCP endpoint** for Claude tool integration.
+Live REST API for Indian financial news with OpenAI sentiment, company normalization, sector tagging, and an MCP endpoint for chat/agent integration.
 
-```
-              ┌─────────── prism news api ───────────┐
-              │                                       │
-RSS feeds ───►│ fetch → parse → dedup → tag → store  │──► MongoDB
-(82, 10min)   │                       │      │       │
-              │                       ▼      ▼       │
-              │             companies+sector  hindi  │
-              │                       │      filter  │
-              │                       ▼              │
-              │             LLM (openai / hf / heur.)│
-              │                       │              │
-              └─────── REST + /mcp endpoint ─────────┘
-                            │
-                  ┌─────────┼─────────────┐
-                  ▼         ▼             ▼
-              your frontend  Claude (MCP)  any client
+**Base URL (production):** `http://<gcp-server>:8001`
+**Swagger UI:** `http://<gcp-server>:8001/docs`
+
+---
+
+## Quick start for frontend integration
+
+### 1. Headline feed (newsroom UI)
+
+```http
+GET /news?sector=BANKING&hours=24&limit=50&fuzzy=true
 ```
 
-## What's new in v5
-
-| Feature | Endpoint / Module |
-|---|---|
-| Per-company sentiment summary + trend | `GET /news/summary?company=...` |
-| Most-mentioned companies | `GET /news/trending` |
-| Source reliability stats | `GET /news/sources` |
-| Multi-company side-by-side | `GET /news/compare?companies=a,b,c` |
-| Sector filter (8 sectors) | `GET /news?sector=BANKING` |
-| Company directory | `GET /news/companies`, `GET /news/sectors` |
-| **MCP server** (Claude tools) | `GET /mcp`, `POST /mcp` |
-| LLM provider chain (OpenAI → heuristic) | `llm_provider.py` |
-| Company aliases ("HDFC" = "HDFC Bank") | `company_aliases.py` |
-| Fuzzy dedup, Google News URL resolver, Hindi filter | `dedup.py` |
-| Bulk loader for `financial_news_backup.json` | `load_backup.py` |
-
-## Endpoints
-
-### `GET /news`
-Main feed. Back-compatible; new query params on top.
-
-| Param | Default | Notes |
-|---|---|---|
-| `company` | — | CSV: `HDFC,ICICI,TCS`. Aliases accepted. |
-| `sector` | — | `BANKING\|TECH\|AUTO\|PHARMA\|ENERGY\|FMCG\|METALS\|REALTY` |
-| `hours` | 24 | 1–240 |
-| `page`, `limit` | 1, 50 | pagination |
-| `fuzzy` | `true` | collapse near-duplicate titles (token-set ≥ 0.85) |
-| `resolve_links` | `true` | resolve `news.google.com/rss/articles/...` → publisher URL |
-
-Each article now includes:
+Response shape:
 ```json
 {
-  "title": "...",
-  "source": "Economic Times",
-  "published_ist": "2026-05-24 13:48:48 IST",
-  "link": "https://economictimes.indiatimes.com/...",
-  "original_link": "https://news.google.com/...",      // present only if resolved
-  "companies": ["HDFC Bank"],
-  "sector": "BANKING",
-  "sentiment": {"label": "positive", "score": 0.81, "provider": "openai"}
-}
-```
-
-### `GET /news/summary?company=HDFC Bank`
-```json
-{
-  "company": "HDFC Bank",
-  "total_articles": 45,
-  "sentiment_breakdown": {"positive": 28, "negative": 8, "neutral": 9},
-  "avg_score": 0.72,
-  "trend": "bullish",
-  "trend_detail": {"recent_half": {...}, "older_half": {...}},
-  "top_positive": [...],
-  "top_negative": [...]
-}
-```
-
-### `GET /news/trending?hours=24&limit=20`
-```json
-{
-  "trending": [
-    {"company": "ICICI Bank", "mentions": 45, "sentiment": "positive",
-     "sentiment_breakdown": {"positive": 30, "negative": 5, "neutral": 10},
-     "sector": "BANKING"}
+  "success": true,
+  "query": {"company": null, "sector": "BANKING", "hours": 24, "page": 1, "limit": 50},
+  "meta": {
+    "total_results": 64, "returned": 50, "total_pages": 2, "current_page": 1,
+    "feeds_configured": 82, "response_time_ms": 142,
+    "last_full_fetch_ist": "2026-05-24 13:48:48 IST",
+    "sentiment_provider": "openai",
+    "cache_status": "fresh -> DB only"
+  },
+  "articles": [
+    {
+      "title": "HDFC Bank Q4 profit beats estimates",
+      "description": "...",
+      "source": "Economic Times",
+      "published_ist": "2026-05-24 13:48:48 IST",
+      "published_dt": "2026-05-24T08:18:48Z",
+      "link": "https://economictimes.indiatimes.com/...",
+      "original_link": "https://news.google.com/...",   // present only if Google redirect was resolved
+      "companies": ["HDFC Bank"],
+      "sector": "BANKING",
+      "sentiment": {"label": "positive", "score": 0.81, "provider": "openai"}
+    }
   ]
 }
 ```
 
-### `GET /news/sources?hours=24`
-Per-source article counts, description coverage %, minutes since last article, fresh/stale flag.
+**Query params:**
 
-### `GET /news/compare?companies=HDFC,ICICI,SBI&hours=48`
-Side-by-side sentiment for multiple companies, ranked by `avg_score`.
+| Param | Default | Notes |
+|---|---|---|
+| `company` | — | CSV: `HDFC,ICICI,TCS`. Aliases accepted (`HDFC` → `HDFC Bank`, `TCS` → `Tata Consultancy Services`). |
+| `sector` | — | One of `BANKING\|TECH\|AUTO\|PHARMA\|ENERGY\|FMCG\|METALS\|REALTY` |
+| `hours` | 24 | 1–240 |
+| `page`, `limit` | 1, 50 | pagination; `limit` ≤ 500 |
+| `fuzzy` | `true` | collapse near-duplicate titles (recommended) |
+| `resolve_links` | `true` | unwrap `news.google.com/rss/articles/...` → publisher URL |
 
-### `GET /news/companies`, `GET /news/sectors`
-Directory endpoints for dropdowns.
+**Sentiment is lazy:** `sentiment` is `null` on most articles. It's populated when the article is returned via a company-specific query. Once analyzed, the result is persisted to Mongo and reused on every subsequent request.
+
+### 2. Per-company summary card
+
+```http
+GET /news/summary?company=HDFC%20Bank&hours=24
+```
+
+```json
+{
+  "company": "HDFC Bank",
+  "input": "HDFC Bank",
+  "total_articles": 45,
+  "sentiment_breakdown": {"positive": 28, "negative": 8, "neutral": 9},
+  "avg_score": 0.72,
+  "trend": "bullish",
+  "trend_detail": {
+    "recent_half": {"positive": 16, "negative": 3},
+    "older_half":  {"positive": 12, "negative": 5}
+  },
+  "top_positive": [{"title":"…","source":"…","link":"…","sentiment":{…}}],
+  "top_negative": [...],
+  "provider": "openai"
+}
+```
+
+**First-call latency**: 5–10s while OpenAI analyzes fresh articles in parallel. Subsequent calls for the same company in the same window: sub-second (Mongo-cached).
+
+### 3. Trending companies sidebar
+
+```http
+GET /news/trending?hours=24&limit=10
+```
+
+```json
+{
+  "hours": 24,
+  "trending": [
+    {"company":"Reliance Industries","mentions":19,"sentiment":"positive","sector":"ENERGY",
+     "sentiment_breakdown":{"positive":12,"negative":2,"neutral":5}},
+    {"company":"NTPC","mentions":11,"sentiment":"neutral","sector":"ENERGY", ...}
+  ]
+}
+```
+
+### 4. Multi-company comparison
+
+```http
+GET /news/compare?companies=HDFC,ICICI,SBI&hours=48
+```
+
+Returns each company's summary side-by-side, ranked by `avg_score` (best → worst). Useful for side-by-side charts.
+
+### 5. Source reliability strip
+
+```http
+GET /news/sources?hours=24
+```
+
+Per-source article count, description coverage %, minutes since last article, fresh/stale flag. Use this to render a "data sources" footer or admin dashboard.
+
+### 6. Directory endpoints (for dropdowns)
+
+```http
+GET /news/companies   → {"total": 83, "companies": ["HDFC Bank", "ICICI Bank", ...]}
+GET /news/sectors     → {"sectors": ["BANKING","TECH","AUTO","PHARMA","ENERGY","FMCG","METALS","REALTY"]}
+```
+
+### 7. Health
+
+```http
+GET /health
+```
+
+```json
+{
+  "status": "running",
+  "collecting_24_7": true,
+  "llm_provider": "openai",
+  "total_articles": 205474,
+  "articles_with_sentiment": 1247,
+  "articles_with_companies_tagged": 15319,
+  "last_24h": 5141, "last_1h": 800,
+  "sources_active": 229,
+  "feeds": 82,
+  "last_fetch": "2026-05-24 13:48:48 IST"
+}
+```
 
 ---
 
-## MCP (Claude tool) integration
+## Frontend wire-up cheat-sheet (matches the newsroom UI screenshot)
 
-The `/mcp` endpoint follows MCP tool-discovery + invocation conventions. Three tools are exposed:
+| UI element | Endpoint |
+|---|---|
+| Sector chips (`ALL / BANKING / TECH / …`) | `GET /news/sectors` then `GET /news?sector=…` per chip |
+| `N headlines` count | `meta.total_results` from `/news` |
+| Hero BREAKING card | `articles[0]` — render `title`, `source`, `companies[0]`, `sector`, "ago" from `published_ist` |
+| Headline list rows | `articles[1..N]` — `published_ist` → ago, `companies[0]` → ticker prefix, `source` → right-side small caps |
+| `ROUTED TO` cards | Top 3 sectors from `articles[]` grouped by `.sector` (e.g. BANKING DESK, SECTOR TRACKER, ENERGY LEAD) |
+| Volume sparkline | 20 buckets × 3 min from `articles[].published_ist` over the last hour |
+| `HEADLINES TODAY` stat | `meta.total_results` from `GET /news?hours=24` |
+| `MEDIAN LATENCY` stat | `meta.response_time_ms / 1000` (or roll your own histogram from `/news/sources`) |
+| Bottom ticker | `articles[].title` joined, marquee-scrolled |
+| Auto-refresh | Re-call `/news` every 30s |
 
-| Tool | Input | Output |
-|---|---|---|
-| `search_financial_news` | `{company?, sector?, hours?, limit?}` | articles + sentiment |
-| `get_market_sentiment` | `{company, hours?}` | `{verdict: bullish\|bearish\|neutral, confidence, breakdown, top_positive, top_negative}` |
-| `get_trending_stocks` | `{hours?, limit?}` | trending company list |
+---
+
+## Chat / agent integration via MCP
+
+The API exposes a Model Context Protocol endpoint at `/mcp` so LLM-driven chat systems can call it as a tool without you writing per-endpoint plumbing.
 
 ### Discovery
-```
+
+```http
 GET /mcp
 ```
+
 ```json
 {
   "protocol": "mcp", "version": "2024-11-05",
   "server": {"name": "prism-news", "version": "5.0.0"},
-  "tools": [...]
+  "tools": [
+    {"name": "search_financial_news", "description": "...", "inputSchema": {...}},
+    {"name": "get_market_sentiment",  "description": "...", "inputSchema": {...}},
+    {"name": "get_trending_stocks",   "description": "...", "inputSchema": {...}}
+  ]
 }
 ```
 
 ### Invocation
-```
+
+```http
 POST /mcp
+Content-Type: application/json
+
 {"tool": "get_market_sentiment", "arguments": {"company": "HDFC Bank", "hours": 24}}
 ```
 
-### Claude Desktop config
+```json
+{"tool": "get_market_sentiment", "result": {"verdict":"bullish", "confidence":0.42, ...}}
+```
+
+### The three tools
+
+| Tool | Use when | Returns |
+|---|---|---|
+| `search_financial_news` | "Show me banking news" / "What's the news on Wipro?" | article list + sentiment per item |
+| `get_market_sentiment` | "How is HDFC Bank doing today?" | `{verdict, confidence, breakdown, top_positive, top_negative}` |
+| `get_trending_stocks` | "What's hot right now?" | top N companies + aggregate sentiment |
+
+### Drop into Claude Desktop / Claude Code
+
+`~/.claude/claude_desktop_config.json`:
 
 ```json
 {
   "mcpServers": {
     "prism-news": {
       "transport": "http",
-      "url": "http://your-server:8000/mcp"
+      "url": "http://<gcp-server>:8001/mcp"
     }
   }
 }
 ```
 
-Or wire it into your own chat system by calling `POST /mcp` whenever the LLM invokes one of the three tool names.
+### Drop into a custom chat system
+
+Whenever your LLM calls one of the three tool names, forward the call to:
+
+```javascript
+async function callPrismTool(toolName, args) {
+  const r = await fetch(`${PRISM_NEWS_URL}/mcp`, {
+    method: 'POST',
+    headers: {'content-type': 'application/json'},
+    body: JSON.stringify({tool: toolName, arguments: args}),
+  });
+  if (!r.ok) throw new Error(`prism-news ${r.status}`);
+  return (await r.json()).result;
+}
+```
+
+A pre-written **Claude Code skill** (`prism-news.skill.md`) is included in the repo — drop it into the dev's `~/.claude/skills/` directory and Claude will know when and how to call the API.
 
 ---
 
-## LLM provider chain
+## Data shapes you'll get in articles
 
-Sentiment + company extraction use a fallback chain. Set `LLM_PROVIDER` in `.env`:
+### `sentiment` (when populated)
 
-| `LLM_PROVIDER` | Behavior |
+```json
+{
+  "label": "positive | negative | neutral",
+  "score": 0.0 - 1.0,
+  "provider": "openai | heuristic"
+}
+```
+
+- `provider: "openai"` — analyzed by gpt-4o-mini, high quality
+- `provider: "heuristic"` — fell back to keyword scoring (OpenAI was down or rate-limited); verdicts still directional but lower confidence
+
+### `companies` (always present, may be `[]`)
+
+Array of canonical company names. Aliases are normalized: `HDFC`, `HDFC Bank`, `HDFC Ltd` all show as `"HDFC Bank"`. ~80 Indian-listed companies tracked — see `company_aliases.py` for the full list, or `GET /news/companies`.
+
+### `sector` (always present, may be `null`)
+
+One of 8 codes: `BANKING | TECH | AUTO | PHARMA | ENERGY | FMCG | METALS | REALTY`. Detected via company → sector mapping first, keyword fallback otherwise. ~60% of articles get a sector tag.
+
+### `link` vs `original_link`
+
+Most `news.google.com` redirect URLs are unwrapped to the real publisher URL. When that happens, `link` contains the publisher URL and `original_link` keeps the Google URL for reference. If unwrap failed or wasn't a Google URL to begin with, only `link` is present.
+
+---
+
+## Practical notes for the frontend dev
+
+- **CORS is wide-open** (`*`) — call from any origin.
+- **No auth headers required** — protect with nginx basic-auth / API gateway at the infra layer if needed.
+- **Pagination**: prefer increasing `limit` over walking `page` for the newsroom UI (most users only see the top 30).
+- **Fuzzy dedup is on by default** — turn off with `?fuzzy=false` only if you want every near-duplicate (rare; usually noise).
+- **`hours=24` is the cheapest query** because it uses the warm index. Asking for `hours=168` works but is slower.
+- **Refresh cadence**: the API back-end re-fetches every 10 min internally. Polling `/news` from the UI every 30s is fine — most responses serve from cache (`cache_status: "fresh -> DB only"`).
+- **Article counts**: at any given time there are ~200k articles in the DB across all time, ~5k fetched in the last 24h.
+- **Hindi articles are filtered at ingest** — you'll never see Devanagari in the feed.
+
+---
+
+## Practical notes for the chat-system dev
+
+- **Use MCP, not raw REST** — the three MCP tools cover 90% of chat use cases and give consistent shapes.
+- **First-call OpenAI latency is real** — `get_market_sentiment` on a never-queried company takes 5–10s while OpenAI scores ~10 articles. Cache hit on second call.
+- **When to use which tool:**
+  - User asks about a specific stock → `get_market_sentiment`
+  - User asks what's moving / trending → `get_trending_stocks`
+  - User asks for a list of articles → `search_financial_news`
+- **The skill file (`prism-news.skill.md`)** has decision rules + answer-shaping templates. Hand it to anyone configuring a Claude-based agent.
+- **Don't fabricate** — if a query returns `total_articles: 0`, tell the user "no news found", don't invent.
+
+---
+
+## API surface summary
+
+| Endpoint | Purpose |
 |---|---|
-| `auto` (default) | OpenAI if `OPENAI_API_KEY` set → heuristic |
-| `openai` | OpenAI only |
-| `heuristic` | Keyword-based, no API calls |
-
-### Use a different OpenAI-compatible API
-Set `OPENAI_BASE_URL` (e.g. Azure, Together, vLLM, Groq). The model is controlled by `OPENAI_MODEL` (default `gpt-4o-mini`).
-
-```env
-OPENAI_API_KEY=sk-...
-OPENAI_BASE_URL=https://api.groq.com/openai/v1
-OPENAI_MODEL=llama-3.3-70b-versatile
-```
+| `GET /` | API info |
+| `GET /health` | ops status |
+| `GET /stats` | last-24h rollups (sources, sentiment, sectors) |
+| `GET /news` | main feed; `company`, `sector`, `hours`, `page`, `limit`, `fuzzy`, `resolve_links` |
+| `GET /news/summary` | per-company sentiment + trend |
+| `GET /news/trending` | most-mentioned companies |
+| `GET /news/sources` | source reliability |
+| `GET /news/compare` | multi-company side-by-side |
+| `GET /news/companies` | canonical company directory |
+| `GET /news/sectors` | sector code list |
+| `GET /mcp` | tool discovery |
+| `POST /mcp` | invoke tool by name |
+| `GET /docs` | Swagger UI |
 
 ---
 
-## Loading the 205k-article backup
+## Files in this repo
+
+| File | Purpose |
+|---|---|
+| `main.py` | FastAPI app, all endpoints |
+| `feeds_config.py` | 82 RSS feed URLs + Google News queries |
+| `llm_provider.py` | OpenAI sentiment client + heuristic fallback |
+| `company_aliases.py` | 80+ canonical names, aliases, sector mapping |
+| `dedup.py` | fuzzy dedup, Google URL resolver, Hindi filter |
+| `load_backup.py` | bulk loader / re-tagger for historical data |
+| `test_feeds.py` | RSS feed health checker (CI) |
+| `prism-news.skill.md` | Drop-in Claude Code skill for chat integration |
+| `docker-compose.yml` | Mongo + API stack |
+| `requirements.txt` | python deps |
+
+---
+
+## Ops / server admin (handover)
 
 ```bash
-# Make sure MongoDB is up first
-python load_backup.py                              # full load, with company/sector tagging
-python load_backup.py --skip-tagging               # faster, leaves companies=[] / sector=null
-python load_backup.py --retag-only                 # re-tag existing collection only
-python load_backup.py --batch 2000                 # tune batch size
+# Deploy a new build
+git pull origin main
+docker compose build newsapi
+docker compose up -d newsapi              # in-place swap, mongo untouched
+docker compose logs -f newsapi            # confirm "LLM provider chain active: openai"
+
+# Backfill / re-tag existing rows after an alias-map change
+docker compose exec newsapi python load_backup.py --retag-only --batch 2000
+
+# Article count sanity check
+docker compose exec mongodb mongosh -u newsadmin -p "$MONGO_PASSWORD" \
+  --eval 'db.getSiblingDB("financial_news").articles.countDocuments()'
 ```
 
-The loader:
-1. Normalizes `{$oid}` / `{$date}` from mongoexport format
-2. Drops Hindi articles
-3. Detects companies + sector via alias map
-4. Computes `title_key` (normalized hash for fuzzy dedup)
-5. Upserts on `dedup_key` — re-runs are idempotent
+**Required env in `.env`:**
+
+| Var | Required | Default | Notes |
+|---|---|---|---|
+| `OPENAI_API_KEY` | ✅ | — | sentiment + company extraction |
+| `MONGO_URI` | — | `mongodb://localhost:27017` | full URI w/ auth |
+| `MONGO_PASSWORD` | ✅ for docker-compose | — | seeded into Mongo container on first boot |
+| `DB_NAME` | — | `financial_news` | |
+| `OPENAI_BASE_URL` | — | `https://api.openai.com/v1` | override for Azure/Groq/Together/etc. |
+| `OPENAI_MODEL` | — | `gpt-4o-mini` | |
+| `LLM_PROVIDER` | — | `auto` | `auto\|openai\|heuristic` |
+
+**Rollback:** `git reset --hard <prev-sha> && docker compose up -d --build newsapi`.
 
 ---
 
-## Environment
+## Questions for the integrating dev to ask
 
-| Var | Default | Purpose |
-|---|---|---|
-| `MONGO_URI` | `mongodb://localhost:27017` | MongoDB |
-| `DB_NAME` | `financial_news` | DB |
-| `OPENAI_API_KEY` | — | LLM key (sentiment + company extraction) |
-| `OPENAI_BASE_URL` | `https://api.openai.com/v1` | override for compatible APIs |
-| `OPENAI_MODEL` | `gpt-4o-mini` | model name |
-| `LLM_PROVIDER` | `auto` | `auto\|openai\|heuristic` |
-
----
-
-## Quickstart
-
-```bash
-pip install -r requirements.txt
-# put OPENAI_API_KEY in .env
-docker-compose up -d mongodb                # or use a remote Mongo
-python load_backup.py                       # one-time backfill of 205k articles
-python main.py                              # http://localhost:8000
-```
-
-### Smoke test
-```bash
-curl 'http://localhost:8000/news?sector=BANKING&limit=5'
-curl 'http://localhost:8000/news/summary?company=HDFC%20Bank'
-curl 'http://localhost:8000/news/trending'
-curl -X POST http://localhost:8000/mcp \
-  -H 'content-type: application/json' \
-  -d '{"tool":"get_market_sentiment","arguments":{"company":"Reliance Industries"}}'
-```
-
----
-
-## Architecture notes
-
-- **Caching**: `/news` triggers a full fetch only if last fetch > 5 min ago; otherwise serves from DB. Background scheduler re-fetches every 10 min.
-- **Sentiment is lazy**: only computed when an article is returned in a company-specific query. Result is persisted, never re-analyzed.
-- **Concurrency**: Google News capped at 10 concurrent (anti-throttle); general feeds 80.
-- **Dedup**: `dedup_key` (md5 of normalized title) for storage; `title_key` (stricter — strips numbers + source suffixes) + token-set Jaccard at query time.
-- **Hindi filter**: titles with ≥10% Devanagari characters are dropped at ingest.
-
-## EC2 deployment, systemd, nginx
-(Same as v4 — see `docker-compose.yml`. Just expose port 8000 and run `python main.py`.)
+- **Auth boundary** — should I sit behind your nginx? An API gateway? Token check?
+- **Refresh cadence** — UI poll every 30s OK, or do you need server-sent events / websockets?
+- **Caching layer** — fronting with CDN/Redis? Most responses are already <200ms from Mongo cache.
+- **Custom companies** — need to add a private/unlisted company to the alias map? One-line edit in `company_aliases.py` + retag.
+- **Custom sector** — same: edit `SECTORS` + `SECTOR_BY_COMPANY` + `SECTOR_KEYWORDS`, retag.
