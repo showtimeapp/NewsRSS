@@ -17,7 +17,11 @@ Run once when the upstream taxonomy changes:
 
 Requires:
     pip install psycopg2-binary
-    POSTGRES_URL env var (or hardcode below).
+    POSTGRES_URL env var (no default — script exits if unset).
+    STATE_DB env var (or default Windows path) pointing at state.db.
+
+Put POSTGRES_URL in .env (gitignored) and source it before running:
+    set -a; source .env; set +a; python build_company_master.py
 """
 import json
 import os
@@ -26,6 +30,12 @@ import sqlite3
 import sys
 from collections import defaultdict
 from pathlib import Path
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 try:
     import psycopg2
@@ -176,10 +186,13 @@ def build_aliases(canonical: str, nse_symbol: str | None) -> list[str]:
 
 
 def main():
-    pg_url = os.getenv(
-        "POSTGRES_URL",
-        "postgresql://stock_user:eygbAWxNVvi06sy3ppu25AKxSEi0RZwr@35.234.221.166:5434/stock_chat",
-    )
+    pg_url = os.getenv("POSTGRES_URL")
+    if not pg_url:
+        sys.exit(
+            "POSTGRES_URL not set. Add it to NewsRSS/.env (gitignored) as:\n"
+            "  POSTGRES_URL=postgresql://USER:PASSWORD@HOST:PORT/DBNAME\n"
+            "then re-run."
+        )
     # asyncpg-flavored URL -> sync
     pg_url = pg_url.replace("postgresql+asyncpg://", "postgresql://")
 
@@ -187,6 +200,11 @@ def main():
         "STATE_DB",
         r"C:\Users\adity\Downloads\NSE_BSE_pdfs\NSE_BSE_pdfs\data\state.db",
     )
+    if not os.path.exists(sqlite_path):
+        sys.exit(
+            f"state.db not found at {sqlite_path}\n"
+            "Set STATE_DB env var to the correct path."
+        )
 
     print(f"PG     : {pg_url.split('@')[1] if '@' in pg_url else pg_url}")
     print(f"SQLite : {sqlite_path}")
