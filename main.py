@@ -212,7 +212,9 @@ async def fetch_one(session, source_name, url):
                                    ssl=False) as resp:
                 if resp.status != 200: return []
                 body = await resp.read()
-                return parse_feed_bytes(body, source_name, url)
+                # parse_feed_bytes runs detect_companies (~1.4ms/article over 13k
+                # aliases); off-loop'ing it keeps HTTP I/O from starving other feeds.
+                return await asyncio.to_thread(parse_feed_bytes, body, source_name, url)
         except: return []
 
 
