@@ -513,14 +513,29 @@ async def get_news(
     fuzzy: bool = Query(True, description="Collapse near-duplicate titles"),
 ):
     """
-    Read-only feed query — serves entirely from MongoDB.
+    Feed query.
 
-    Ingest is decoupled: the 10-min background scheduler is the ONLY thing that
-    fetches RSS feeds. Searches no longer trigger on-demand fetches (which
-    previously caused outbound-connection bursts under load).
+    - WITHOUT `company`: pure DB query, instant.
+    - WITH `company`: also fetches the 3 per-company Google News feeds so the
+      response includes the very latest headlines for that ticker.
+
+    The full 81-feed catalog is refreshed ONLY by the 10-min background
+    scheduler — searches never trigger a full fetch (avoids the outbound
+    thundering-herd that crushed feed success rate).
     """
     t = _time.monotonic()
+    stale = needs_full()
+    cn, fn, sn = 0, 0, 0
     companies = _parse_companies_csv(company)
+
+    if companies:
+        # Targeted per-company fetch only (3 Google News queries per company —
+        # cheap, doesn't stampede unrelated publishers).
+        all_company_feeds = []
+        for c in companies:
+            all_company_feeds.extend(get_company_feeds(c))
+        ca = await fetch_parallel(all_company_feeds, http_session)
+        cn = await store_articles(ca)
 
     articles, total, sn = await query_articles_with_sentiment(
         companies, sector, hours, page, limit,
@@ -532,6 +547,14 @@ async def get_news(
     age_min = None
     if last_full_fetch:
         age_min = int((datetime.now(timezone.utc) - last_full_fetch).total_seconds() / 60)
+
+    # cache_status semantics:
+    #   "stale -> fetched"   user-search triggered a per-company fetch and we have fresh data
+    #   "fresh -> DB only"   DB was fresh enough; no fetch happened on this request
+    if companies:
+        cache_status = "stale -> fetched" if stale else "fresh -> DB only"
+    else:
+        cache_status = "fresh -> DB only"
 
     return {
         "success": True,
@@ -547,9 +570,10 @@ async def get_news(
                 "%Y-%m-%d %H:%M:%S IST") if last_full_fetch else None,
             "data_age_min": age_min,
             "refresh_interval_min": FETCH_INTERVAL_MIN,
+            "new_articles": {"company_search": cn, "full_fetch": fn},
             "sentiment_analyzed_this_request": sn,
             "sentiment_provider": active_provider(),
-            "cache_status": "db_only",
+            "cache_status": cache_status,
         },
         "articles": articles,
     }
