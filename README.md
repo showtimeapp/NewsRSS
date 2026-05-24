@@ -1,224 +1,232 @@
-# Financial News Aggregator API
+# Prism Financial News API (v5.0)
 
-Single FastAPI endpoint that aggregates **124+ RSS feeds** from 25+ publishers, stores in MongoDB with dedup, and serves via a smart-cached API.
-
-## Architecture
+A FastAPI service that aggregates **82+ RSS feeds** from 24+ publishers, tags articles by **company** and **sector**, runs **LLM-powered sentiment**, and exposes the data via REST + an **MCP endpoint** for Claude tool integration.
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                   FastAPI Server                     │
-│                                                     │
-│  Background Scheduler (every 10 min)                │
-│  ├── Fetches 124+ RSS feeds in PARALLEL (50 workers)│
-│  ├── Parses title, desc, source, pubDate            │
-│  ├── Converts all timestamps to IST                 │
-│  └── Stores in MongoDB (link = unique, no dupes)    │
-│                                                     │
-│  GET /news endpoint                                 │
-│  ├── ?company=Wipro → Google RSS + DB search        │
-│  ├── Within 5 min cache → serve from DB only        │
-│  ├── After 5 min cache → full fetch + serve         │
-│  └── Returns: title, description, source, time, link│
-└──────────────────┬──────────────────────────────────┘
-                   │
-                   ▼
-          ┌────────────────┐
-          │    MongoDB      │
-          │                │
-          │  articles coll │
-          │  unique: link  │
-          └────────────────┘
+              ┌─────────── prism news api ───────────┐
+              │                                       │
+RSS feeds ───►│ fetch → parse → dedup → tag → store  │──► MongoDB
+(82, 10min)   │                       │      │       │
+              │                       ▼      ▼       │
+              │             companies+sector  hindi  │
+              │                       │      filter  │
+              │                       ▼              │
+              │             LLM (openai / hf / heur.)│
+              │                       │              │
+              └─────── REST + /mcp endpoint ─────────┘
+                            │
+                  ┌─────────┼─────────────┐
+                  ▼         ▼             ▼
+              your frontend  Claude (MCP)  any client
 ```
 
-## API Usage
+## What's new in v5
 
-### Get all financial news (last 24 hours)
-```
-GET /news
-GET /news?hours=48&page=1&limit=100
-```
+| Feature | Endpoint / Module |
+|---|---|
+| Per-company sentiment summary + trend | `GET /news/summary?company=...` |
+| Most-mentioned companies | `GET /news/trending` |
+| Source reliability stats | `GET /news/sources` |
+| Multi-company side-by-side | `GET /news/compare?companies=a,b,c` |
+| Sector filter (8 sectors) | `GET /news?sector=BANKING` |
+| Company directory | `GET /news/companies`, `GET /news/sectors` |
+| **MCP server** (Claude tools) | `GET /mcp`, `POST /mcp` |
+| LLM provider chain (OpenAI → heuristic) | `llm_provider.py` |
+| Company aliases ("HDFC" = "HDFC Bank") | `company_aliases.py` |
+| Fuzzy dedup, Google News URL resolver, Hindi filter | `dedup.py` |
+| Bulk loader for `financial_news_backup.json` | `load_backup.py` |
 
-### Search specific company
-```
-GET /news?company=Wipro
-GET /news?company=HDFC Bank&hours=72&limit=200
-GET /news?company=Reliance Industries&page=2
-```
+## Endpoints
 
-### Response format
+### `GET /news`
+Main feed. Back-compatible; new query params on top.
+
+| Param | Default | Notes |
+|---|---|---|
+| `company` | — | CSV: `HDFC,ICICI,TCS`. Aliases accepted. |
+| `sector` | — | `BANKING\|TECH\|AUTO\|PHARMA\|ENERGY\|FMCG\|METALS\|REALTY` |
+| `hours` | 24 | 1–240 |
+| `page`, `limit` | 1, 50 | pagination |
+| `fuzzy` | `true` | collapse near-duplicate titles (token-set ≥ 0.85) |
+| `resolve_links` | `true` | resolve `news.google.com/rss/articles/...` → publisher URL |
+
+Each article now includes:
 ```json
 {
-  "success": true,
-  "query": { "company": "Wipro", "hours": 24, "page": 1, "limit": 50 },
-  "meta": {
-    "total_results": 342,
-    "returned": 50,
-    "total_pages": 7,
-    "feeds_configured": 124,
-    "last_full_fetch_ist": "2026-04-14 15:30:00 IST",
-    "cache_status": "fresh (from DB)"
-  },
-  "articles": [
-    {
-      "title": "Wipro Q4 Results: Net profit rises 15%",
-      "description": "IT major Wipro reported a 15% rise in...",
-      "source": "Economic Times",
-      "published_ist": "2026-04-14 14:22:00 IST",
-      "link": "https://economictimes.indiatimes.com/..."
-    }
+  "title": "...",
+  "source": "Economic Times",
+  "published_ist": "2026-05-24 13:48:48 IST",
+  "link": "https://economictimes.indiatimes.com/...",
+  "original_link": "https://news.google.com/...",      // present only if resolved
+  "companies": ["HDFC Bank"],
+  "sector": "BANKING",
+  "sentiment": {"label": "positive", "score": 0.81, "provider": "openai"}
+}
+```
+
+### `GET /news/summary?company=HDFC Bank`
+```json
+{
+  "company": "HDFC Bank",
+  "total_articles": 45,
+  "sentiment_breakdown": {"positive": 28, "negative": 8, "neutral": 9},
+  "avg_score": 0.72,
+  "trend": "bullish",
+  "trend_detail": {"recent_half": {...}, "older_half": {...}},
+  "top_positive": [...],
+  "top_negative": [...]
+}
+```
+
+### `GET /news/trending?hours=24&limit=20`
+```json
+{
+  "trending": [
+    {"company": "ICICI Bank", "mentions": 45, "sentiment": "positive",
+     "sentiment_breakdown": {"positive": 30, "negative": 5, "neutral": 10},
+     "sector": "BANKING"}
   ]
 }
 ```
 
-### Health check
+### `GET /news/sources?hours=24`
+Per-source article counts, description coverage %, minutes since last article, fresh/stale flag.
+
+### `GET /news/compare?companies=HDFC,ICICI,SBI&hours=48`
+Side-by-side sentiment for multiple companies, ranked by `avg_score`.
+
+### `GET /news/companies`, `GET /news/sectors`
+Directory endpoints for dropdowns.
+
+---
+
+## MCP (Claude tool) integration
+
+The `/mcp` endpoint follows MCP tool-discovery + invocation conventions. Three tools are exposed:
+
+| Tool | Input | Output |
+|---|---|---|
+| `search_financial_news` | `{company?, sector?, hours?, limit?}` | articles + sentiment |
+| `get_market_sentiment` | `{company, hours?}` | `{verdict: bullish\|bearish\|neutral, confidence, breakdown, top_positive, top_negative}` |
+| `get_trending_stocks` | `{hours?, limit?}` | trending company list |
+
+### Discovery
 ```
-GET /health
+GET /mcp
 ```
-
-## Smart Caching Logic
-
-```
-Request comes in
-    │
-    ├── Has company name?
-    │   ├── YES → Always fetch Google News RSS for that company
-    │   │         └── Last full fetch < 5 min ago?
-    │   │             ├── YES → Return company results from DB (fast)
-    │   │             └── NO  → Also run full 124-feed fetch, then return
-    │   │
-    │   └── NO → Last full fetch < 5 min ago?
-    │            ├── YES → Return all news from DB (fast, ~50ms)
-    │            └── NO  → Run full 124-feed fetch, then return
-    │
-    Background scheduler runs every 10 min regardless
-```
-
-## EC2 Deployment
-
-### 1. Launch EC2 Instance
-- **AMI:** Ubuntu 24.04 LTS
-- **Type:** t3.medium (2 vCPU, 4GB RAM) minimum
-- **Storage:** 20GB+ (for MongoDB data)
-- **Security Group:** Open ports 8000 (API) and 22 (SSH)
-
-### 2. Install Dependencies
-```bash
-# SSH into EC2
-ssh -i your-key.pem ubuntu@your-ec2-ip
-
-# Update system
-sudo apt update && sudo apt upgrade -y
-
-# Install Python 3.11+
-sudo apt install -y python3 python3-pip python3-venv
-
-# Install MongoDB
-# (Option A: Local MongoDB)
-sudo apt install -y gnupg curl
-curl -fsSL https://www.mongodb.org/static/pgp/server-7.0.asc | sudo gpg -o /usr/share/keyrings/mongodb-server-7.0.gpg --dearmor
-echo "deb [ signed-by=/usr/share/keyrings/mongodb-server-7.0.gpg ] https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/7.0 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb-org-7.0.list
-sudo apt update
-sudo apt install -y mongodb-org
-sudo systemctl start mongod
-sudo systemctl enable mongod
-
-# (Option B: Use MongoDB Atlas free tier — just set MONGO_URI env var)
-```
-
-### 3. Deploy the App
-```bash
-# Clone/upload your project
-mkdir ~/financial-news-api && cd ~/financial-news-api
-# Upload main.py, feeds_config.py, requirements.txt
-
-# Create virtual environment
-python3 -m venv venv
-source venv/bin/activate
-
-# Install packages
-pip install -r requirements.txt
-
-# Test run
-python main.py
-# Visit http://your-ec2-ip:8000/docs for Swagger UI
-```
-
-### 4. Run as Service (systemd)
-```bash
-sudo tee /etc/systemd/system/newsapi.service << 'EOF'
-[Unit]
-Description=Financial News Aggregator API
-After=network.target mongod.service
-
-[Service]
-Type=simple
-User=ubuntu
-WorkingDirectory=/home/ubuntu/financial-news-api
-Environment="MONGO_URI=mongodb://localhost:27017"
-Environment="DB_NAME=financial_news"
-ExecStart=/home/ubuntu/financial-news-api/venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000
-Restart=always
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-sudo systemctl daemon-reload
-sudo systemctl enable newsapi
-sudo systemctl start newsapi
-sudo systemctl status newsapi
-
-# View logs
-sudo journalctl -u newsapi -f
-```
-
-### 5. Optional: Nginx Reverse Proxy
-```bash
-sudo apt install -y nginx
-
-sudo tee /etc/nginx/sites-available/newsapi << 'EOF'
-server {
-    listen 80;
-    server_name your-domain.com;
-
-    location / {
-        proxy_pass http://127.0.0.1:8000;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_read_timeout 120s;
-    }
+```json
+{
+  "protocol": "mcp", "version": "2024-11-05",
+  "server": {"name": "prism-news", "version": "5.0.0"},
+  "tools": [...]
 }
-EOF
-
-sudo ln -s /etc/nginx/sites-available/newsapi /etc/nginx/sites-enabled/
-sudo nginx -t && sudo systemctl restart nginx
 ```
 
-## Environment Variables
+### Invocation
+```
+POST /mcp
+{"tool": "get_market_sentiment", "arguments": {"company": "HDFC Bank", "hours": 24}}
+```
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `MONGO_URI` | `mongodb://localhost:27017` | MongoDB connection string |
-| `DB_NAME` | `financial_news` | Database name |
+### Claude Desktop config
 
-## Feeds Covered (124+)
+```json
+{
+  "mcpServers": {
+    "prism-news": {
+      "transport": "http",
+      "url": "http://your-server:8000/mcp"
+    }
+  }
+}
+```
 
-| Publisher | Feeds | Articles/day |
-|-----------|-------|-------------|
-| Economic Times | 15 | ~200+ |
-| Moneycontrol | 12 | ~150+ |
-| Business Standard | 22 | ~100+ |
-| Livemint | 10 | ~80+ |
-| The Hindu / BL | 8 | ~60+ |
-| CNBC TV18 | 5 | ~50+ |
-| Financial Express | 5 | ~50+ |
-| Indian Express | 5 | ~40+ |
-| NDTV Profit | 2 | ~80+ |
-| Times of India | 2 | ~30+ |
-| Business Today | 3 | ~30+ |
-| Other Indian (12) | 12 | ~100+ |
-| Aggregators (Pulse, Google News, Investing.com) | 10 | ~200+ |
-| Global (Reuters, CNBC US, Bloomberg, etc.) | 10 | ~100+ |
-| NSE Exchange | 3 | varies |
-| **Total** | **124** | **~1500+/day** |
+Or wire it into your own chat system by calling `POST /mcp` whenever the LLM invokes one of the three tool names.
+
+---
+
+## LLM provider chain
+
+Sentiment + company extraction use a fallback chain. Set `LLM_PROVIDER` in `.env`:
+
+| `LLM_PROVIDER` | Behavior |
+|---|---|
+| `auto` (default) | OpenAI if `OPENAI_API_KEY` set → heuristic |
+| `openai` | OpenAI only |
+| `heuristic` | Keyword-based, no API calls |
+
+### Use a different OpenAI-compatible API
+Set `OPENAI_BASE_URL` (e.g. Azure, Together, vLLM, Groq). The model is controlled by `OPENAI_MODEL` (default `gpt-4o-mini`).
+
+```env
+OPENAI_API_KEY=sk-...
+OPENAI_BASE_URL=https://api.groq.com/openai/v1
+OPENAI_MODEL=llama-3.3-70b-versatile
+```
+
+---
+
+## Loading the 205k-article backup
+
+```bash
+# Make sure MongoDB is up first
+python load_backup.py                              # full load, with company/sector tagging
+python load_backup.py --skip-tagging               # faster, leaves companies=[] / sector=null
+python load_backup.py --retag-only                 # re-tag existing collection only
+python load_backup.py --batch 2000                 # tune batch size
+```
+
+The loader:
+1. Normalizes `{$oid}` / `{$date}` from mongoexport format
+2. Drops Hindi articles
+3. Detects companies + sector via alias map
+4. Computes `title_key` (normalized hash for fuzzy dedup)
+5. Upserts on `dedup_key` — re-runs are idempotent
+
+---
+
+## Environment
+
+| Var | Default | Purpose |
+|---|---|---|
+| `MONGO_URI` | `mongodb://localhost:27017` | MongoDB |
+| `DB_NAME` | `financial_news` | DB |
+| `OPENAI_API_KEY` | — | LLM key (sentiment + company extraction) |
+| `OPENAI_BASE_URL` | `https://api.openai.com/v1` | override for compatible APIs |
+| `OPENAI_MODEL` | `gpt-4o-mini` | model name |
+| `LLM_PROVIDER` | `auto` | `auto\|openai\|heuristic` |
+
+---
+
+## Quickstart
+
+```bash
+pip install -r requirements.txt
+# put OPENAI_API_KEY in .env
+docker-compose up -d mongodb                # or use a remote Mongo
+python load_backup.py                       # one-time backfill of 205k articles
+python main.py                              # http://localhost:8000
+```
+
+### Smoke test
+```bash
+curl 'http://localhost:8000/news?sector=BANKING&limit=5'
+curl 'http://localhost:8000/news/summary?company=HDFC%20Bank'
+curl 'http://localhost:8000/news/trending'
+curl -X POST http://localhost:8000/mcp \
+  -H 'content-type: application/json' \
+  -d '{"tool":"get_market_sentiment","arguments":{"company":"Reliance Industries"}}'
+```
+
+---
+
+## Architecture notes
+
+- **Caching**: `/news` triggers a full fetch only if last fetch > 5 min ago; otherwise serves from DB. Background scheduler re-fetches every 10 min.
+- **Sentiment is lazy**: only computed when an article is returned in a company-specific query. Result is persisted, never re-analyzed.
+- **Concurrency**: Google News capped at 10 concurrent (anti-throttle); general feeds 80.
+- **Dedup**: `dedup_key` (md5 of normalized title) for storage; `title_key` (stricter — strips numbers + source suffixes) + token-set Jaccard at query time.
+- **Hindi filter**: titles with ≥10% Devanagari characters are dropped at ingest.
+
+## EC2 deployment, systemd, nginx
+(Same as v4 — see `docker-compose.yml`. Just expose port 8000 and run `python main.py`.)

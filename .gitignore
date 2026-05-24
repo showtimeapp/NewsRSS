@@ -4,3 +4,6 @@ __pycache__/
 .venv/
 venv/
 test_results.json
+financial_news_backup.json
+graphify-out/
+*.smoke_test.py
