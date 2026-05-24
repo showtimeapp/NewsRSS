@@ -200,6 +200,7 @@ general_sem = asyncio.Semaphore(80)
 
 async def fetch_one(session, source_name, url):
     sem = google_sem if "news.google.com" in url else general_sem
+    t0 = _time.monotonic()
     async with sem:
         try:
             headers = dict(BROWSER_HEADERS)
@@ -210,12 +211,22 @@ async def fetch_one(session, source_name, url):
             async with session.get(url, headers=headers,
                                    timeout=aiohttp.ClientTimeout(total=FEED_TIMEOUT_SEC),
                                    ssl=False) as resp:
-                if resp.status != 200: return []
+                if resp.status != 200:
+                    log.warning(f"feed http {resp.status} [{source_name}] {url[:70]}")
+                    return []
                 body = await resp.read()
                 # parse_feed_bytes runs detect_companies (~1.4ms/article over 13k
                 # aliases); off-loop'ing it keeps HTTP I/O from starving other feeds.
-                return await asyncio.to_thread(parse_feed_bytes, body, source_name, url)
-        except: return []
+                arts = await asyncio.to_thread(parse_feed_bytes, body, source_name, url)
+                if not arts:
+                    log.warning(f"feed empty after parse [{source_name}] {url[:70]} (body={len(body)}b)")
+                return arts
+        except asyncio.TimeoutError:
+            log.warning(f"feed timeout {FEED_TIMEOUT_SEC}s [{source_name}] {url[:70]} elapsed={_time.monotonic()-t0:.1f}s")
+            return []
+        except Exception as e:
+            log.warning(f"feed error [{source_name}] {url[:70]} {type(e).__name__}: {str(e)[:120]}")
+            return []
 
 
 async def fetch_parallel(feeds, session):
