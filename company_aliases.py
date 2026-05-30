@@ -283,6 +283,38 @@ _REGEX_CHUNKS_CI = _build_regex_chunks_ci(_REGULAR_ALIASES)
 _REGEX_CHUNKS_CS = _build_regex_chunks_cs(_ACRONYM_ALIASES)
 
 
+# Curated companies — these match without needing finance context (they're top
+# names that always appear in financial conversations).
+_CURATED_NAMES: frozenset = frozenset(CURATED_ALIASES.keys())
+
+# A long-tail (auto-master) company only counts as a real mention if the
+# article ALSO contains at least one financial-signal word.  Stops sports
+# articles tagging India Pesticides, general-news tagging Global Education, etc.
+_FINANCE_CONTEXT_PAT = re.compile(
+    r"\b("
+    r"Q[1-4]|FY\d{0,4}|H[12]\b|"
+    r"earnings|profit|revenue|sales|margin|EBITDA|PAT|"
+    r"shares?|stock|equity|listed|listing|delisted|IPO|FPO|QIP|"
+    r"NSE|BSE|SEBI|RBI|MCX|NCDEX|"
+    r"FII|DII|target|sensex|nifty|bourse|"
+    r"dividend|bonus|split|results?|quarterly|annual\s?report|guidance|outlook|"
+    r"broker(?:age)?|analysts?|rating|buy|sell|hold|upgrade|downgrade|"
+    r"outperform|underperform|mcap|market\s?cap|crore|lakh|rupees?|rs\.?|"
+    r"trading|forecast|subsidiary|promoter|stake|merger|acquisition|"
+    r"divestment|m&a|PSU|MSME|NBFC|fundraising|debenture|bond|mutual\s?fund|"
+    r"valuation|P/E|EPS|book\s?value"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _has_finance_context(text: str) -> bool:
+    """True if the text contains at least one financial-signal word."""
+    if not text:
+        return False
+    return bool(_FINANCE_CONTEXT_PAT.search(text))
+
+
 def detect_companies(text: str) -> list:
     """
     Return canonical company names mentioned in text (deduped, first-occurrence
@@ -307,6 +339,11 @@ def detect_companies(text: str) -> list:
         return []
     # Position-ordered, with longer alias winning on overlap.
     matches.sort(key=lambda x: (x[0], -len(x[1])))
+
+    # Compute finance-context once for the whole article — auto-master
+    # (long-tail) matches need this signal to count as real mentions.
+    has_context = _has_finance_context(text)
+
     found_order = []
     seen = set()
     used_spans = []
@@ -316,6 +353,12 @@ def detect_companies(text: str) -> list:
             continue
         canon = _ALIAS_LOOKUP.get(alias)
         if canon and canon not in seen:
+            # Long-tail (auto-master) companies require finance context.
+            # Curated 80 are always tagged — they're top names that should
+            # surface even in oblique mentions.
+            if canon not in _CURATED_NAMES and not has_context:
+                used_spans.append((start, end))   # consume span so shorter aliases don't re-match
+                continue
             seen.add(canon)
             found_order.append(canon)
         used_spans.append((start, end))
