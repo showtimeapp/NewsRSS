@@ -247,19 +247,44 @@ REFERER_MAP = {
 }
 
 
-def get_all_feeds() -> list[tuple[str, str]]:
-    all_groups = [
-        ET_FEEDS, MC_FEEDS, MINT_FEEDS, NDTV_FEEDS, HINDU_FEEDS,
-        CNBC_FEEDS, IE_FEEDS, TOI_FEEDS, BT_FEEDS, IT_FEEDS,
-        NEWS18_FEEDS, OTHER_FEEDS, AGGREGATOR_FEEDS, GLOBAL_FEEDS,
-        OFFICIAL_FEEDS,
-    ]
+def _flatten(groups: list[dict]) -> list[tuple[str, str]]:
     result = []
-    for group in all_groups:
+    for group in groups:
         for source_name, urls in group.items():
             for url in urls:
                 result.append((source_name, url))
     return result
+
+
+# News-pipeline feeds — fetched every 10 min by the live scheduler.
+_NEWS_GROUPS = [
+    ET_FEEDS, MC_FEEDS, MINT_FEEDS, NDTV_FEEDS, HINDU_FEEDS,
+    CNBC_FEEDS, IE_FEEDS, TOI_FEEDS, BT_FEEDS, IT_FEEDS,
+    NEWS18_FEEDS, OTHER_FEEDS, AGGREGATOR_FEEDS, GLOBAL_FEEDS,
+]
+
+# Filings-pipeline feeds — fetched every 30 min by a separate scheduler.
+# These are official Indian regulator + exchange RSS endpoints (RBI, SEBI,
+# BSE notices, PIB Finance). Lower cadence is intentional:
+#   - regulator endpoints publish slowly (a few items/day)
+#   - we want to be polite to gov.in domains
+#   - filings news doesn't expire in 10 min the way market commentary does
+_FILINGS_GROUPS = [OFFICIAL_FEEDS]
+
+
+def get_all_feeds() -> list[tuple[str, str]]:
+    """All feeds across both pipelines — kept for back-compat / test_feeds.py."""
+    return _flatten(_NEWS_GROUPS + _FILINGS_GROUPS)
+
+
+def get_news_feeds() -> list[tuple[str, str]]:
+    """News pipeline feeds — fast cadence (every 10 min)."""
+    return _flatten(_NEWS_GROUPS)
+
+
+def get_filings_feeds() -> list[tuple[str, str]]:
+    """Filings pipeline feeds — slow cadence (every 30 min), official sources."""
+    return _flatten(_FILINGS_GROUPS)
 
 
 def get_company_feeds(company_name: str) -> list[tuple[str, str]]:
@@ -277,12 +302,17 @@ def get_company_feeds(company_name: str) -> list[tuple[str, str]]:
 
 
 ALL_FEEDS = get_all_feeds()
+NEWS_FEEDS = get_news_feeds()
+FILINGS_FEEDS = get_filings_feeds()
 FEED_COUNT = len(ALL_FEEDS)
+NEWS_FEED_COUNT = len(NEWS_FEEDS)
+FILINGS_FEED_COUNT = len(FILINGS_FEEDS)
 
 if __name__ == "__main__":
     gn = sum(1 for _, u in ALL_FEEDS if "news.google.com" in u)
     direct = FEED_COUNT - gn
     print(f"Total feeds: {FEED_COUNT}")
-    print(f"  Direct RSS: {direct} (fast, 1-2s)")
-    print(f"  Google News: {gn}")
+    print(f"  News pipeline    (10 min cadence): {NEWS_FEED_COUNT}")
+    print(f"  Filings pipeline (30 min cadence): {FILINGS_FEED_COUNT}")
+    print(f"  Direct RSS: {direct} | Google News: {gn}")
     print(f"  Target latency: ~3s per wave (chunked-wave fetcher)")
