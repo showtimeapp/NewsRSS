@@ -180,10 +180,14 @@ _ALIAS_STOPWORDS = frozenset({
     "services", "industries", "industry", "group", "company", "corporation",
     "limited", "ventures", "products", "solutions", "systems", "holdings",
     "international", "global", "indo", "indian", "education", "technologies",
+    "bank", "banks", "banking",   # too generic (matches every "Bank of X")
     # specific high-collision sports/political acronyms
     "ipl", "icc", "bcci", "wpl", "isl", "dea", "fda", "rbi", "sebi", "nse", "bse",
     # short alpha articles / fillers
     "the", "and", "for", "with", "from", "this", "that", "its", "ltd",
+    # PREPOSITIONS — these were the root cause of "bank of" matching every
+    # "Bank of America" / "Bank of Korea" / "Bank of England" headline.
+    "of", "in", "on", "at", "to", "by", "as", "is", "a", "an", "or",
 })
 
 
@@ -218,16 +222,21 @@ def build_aliases(canonical: str, nse_symbol: str | None) -> list[str]:
     }
     # For canonicals with 3+ words, also add the first-2-words prefix as an
     # alias.  "Wardwizard Innovations & Mobility" -> add "wardwizard innovations"
-    # so news copy that drops the "& Mobility" still tags.  Stays distinctive
-    # because we require BOTH words; "global education" (2 words) gets no prefix.
+    # so news copy that drops the "& Mobility" still tags.
+    #
+    # Three guards against collisions:
+    #   1. BOTH words must be non-stopword (filters "bank of", "state of")
+    #   2. BOTH words must be >= 3 chars (filters articles + prepositions
+    #      that may not be in stopwords — defense in depth)
+    #   3. The 2-word prefix itself must not be stopword'd
     words = full_lower.split()
     if len(words) >= 3:
-        two_word_prefix = " ".join(words[:2])
-        # Only add if BOTH words are non-stopwords. "global education" prefix
-        # would still be blocked because "global" is stopword'd elsewhere.
+        w0, w1 = words[0], words[1]
+        two_word_prefix = f"{w0} {w1}"
         if (two_word_prefix not in _ALIAS_STOPWORDS
-                and words[0] not in _ALIAS_STOPWORDS
-                and words[1] not in _ALIAS_STOPWORDS):
+                and w0 not in _ALIAS_STOPWORDS
+                and w1 not in _ALIAS_STOPWORDS
+                and len(w0) >= 3 and len(w1) >= 3):
             aliases.add(two_word_prefix)
     # NSE symbol intentionally NOT added. Stopwords + empty strings filtered.
     aliases = {a for a in aliases if a and a not in _ALIAS_STOPWORDS}
