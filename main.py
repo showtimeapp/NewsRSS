@@ -230,6 +230,84 @@ async def fetch_one(session, source_name, url):
             return []
 
 
+# ─── Filing-event keyword patterns (for /filings endpoint) ───────
+# Maps each filing category to the regex patterns that identify it in a
+# news headline / description.  Used by detect_filing_types() and the
+# /filings endpoint to surface filing-event news (Q4 results, board
+# meetings, dividends, etc.) from the same article stream as /news.
+FILING_PATTERNS = {
+    "Result": [
+        r"\bQ[1-4]\b", r"\bquarterly\s+results?\b", r"\bquarterly\s+earnings?\b",
+        r"\bfinancial\s+results?\b", r"\bearnings?\s+(?:beat|miss|report|call)\b",
+        r"\bnet\s+profit\b", r"\bPAT\b", r"\bEBITDA\b", r"\brevenue\s+(?:rose|grew|fell|dropped|up|down)\b",
+        r"\bH[12]\s+FY\b", r"\bquarter\s+(?:ended|results?)\b",
+    ],
+    "Annual Report": [
+        r"\bannual\s+report\b", r"\bFY\d{2,4}\s+(?:annual|results?)\b",
+    ],
+    "Board Meeting": [
+        r"\bboard\s+meeting\b", r"\bboard\s+decision\b",
+        r"\bboard\s+(?:approves?|considers?|recommends?)\b",
+        r"\boutcome\s+of\s+board\b",
+    ],
+    "AGM/EGM": [
+        r"\bAGM\b", r"\bEGM\b", r"\bannual\s+general\s+meeting\b",
+        r"\bextraordinary\s+general\s+meeting\b",
+    ],
+    "Corp Action": [
+        r"\bdividend\b", r"\bbonus\s+(?:issue|share)\b", r"\bstock\s+split\b",
+        r"\bcorporate\s+action\b", r"\brights\s+issue\b", r"\bbuyback\b",
+        r"\bspecial\s+dividend\b", r"\binterim\s+dividend\b",
+    ],
+    "Insider Trading": [
+        r"\binsider\s+trading\b", r"\bSAST\b",
+        r"\bpromoter\s+(?:stake|shareholding|holding)\b",
+        r"\bsubstantial\s+acquisition\b",
+    ],
+    "M&A": [
+        r"\bmerger\b", r"\bacquisition\b", r"\btakeover\b",
+        r"\bdivestment\b", r"\bdemerger\b", r"\bspin\s?off\b",
+        r"\bacquires?\b", r"\bto\s+acquire\b",
+    ],
+    "IPO": [
+        r"\bIPO\b", r"\bFPO\b", r"\bQIP\b", r"\bDRHP\b", r"\bRHP\b",
+        r"\binitial\s+public\s+offering\b", r"\bissue\s+price\b",
+        r"\bprice\s+band\b", r"\boversubscribed\b",
+    ],
+    "Listing": [
+        r"\blisted\s+on\b", r"\bdelisted\b", r"\bnew\s+listing\b",
+        r"\bnewly\s+listed\b", r"\blisting\s+gains?\b",
+    ],
+    "Allotment": [
+        r"\ballotment\b", r"\bpreferential\s+(?:issue|allotment)\b",
+        r"\bequity\s+allotment\b",
+    ],
+    "Guidance": [
+        r"\bguidance\b", r"\boutlook\b", r"\bforecast\b",
+        r"\bmanagement\s+commentary\b",
+    ],
+    "Rating/Target": [
+        r"\btarget\s+price\b", r"\bprice\s+target\b",
+        r"\b(?:upgrade|downgrade)\s+to\s+(?:buy|sell|hold|neutral)\b",
+        r"\brating\s+(?:upgrade|downgrade|cut|raised)\b",
+    ],
+}
+
+# Compile once at import.
+FILING_REGEX = {
+    cat: re.compile("|".join(pats), re.IGNORECASE)
+    for cat, pats in FILING_PATTERNS.items()
+}
+FILING_CATEGORIES = list(FILING_PATTERNS.keys())
+
+
+def detect_filing_types(text: str) -> list[str]:
+    """Return all filing-event categories that match in `text` (title+desc)."""
+    if not text:
+        return []
+    return [cat for cat, pat in FILING_REGEX.items() if pat.search(text)]
+
+
 CHUNK_SIZE      = 10   # feeds per wave inside fetch_parallel
 CHUNK_PAUSE_SEC = 3    # gap between waves; lets TCP/TLS buffers settle
 
@@ -471,7 +549,7 @@ async def lifespan(app: FastAPI):
     client.close()
 
 
-app = FastAPI(title="Prism Financial News API", version="5.0.0", lifespan=lifespan)
+app = FastAPI(title="Prism Financial News API", version="5.1.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"],
                    allow_methods=["*"], allow_headers=["*"])
 
@@ -806,6 +884,101 @@ async def list_sectors():
 
 
 # ═══════════════════════════════════════════════════
+# /filings — corporate-event filter on top of /news
+# Real-time material filings (results, board meetings, dividends, AGM/EGM,
+# M&A, IPOs, etc.) surfaced from the news pipeline by keyword matching.
+# Not from BSE/NSE direct (their APIs require auth) but covers the same
+# events because publishers (ET, Mint, Moneycontrol) report material filings
+# within minutes.
+# ═══════════════════════════════════════════════════
+@app.get("/filings")
+async def get_filings(
+    company: Optional[str] = Query(None, description="Single company name (or alias)"),
+    sector: Optional[str] = Query(None, description="BANKING|TECH|AUTO|PHARMA|ENERGY|FMCG|METALS|REALTY"),
+    filing_type: Optional[str] = Query(
+        None,
+        description="Filter to one filing category: " + " | ".join(FILING_CATEGORIES),
+    ),
+    hours: int = Query(24, ge=1, le=240),
+    page: int = Query(1, ge=1),
+    limit: int = Query(50, ge=1, le=500),
+    resolve_links: bool = Query(True),
+):
+    """
+    List filing-event news for the given company / sector / window.
+
+    Each article is tagged with detected `filing_types` so the UI can show
+    "Result", "Board Meeting", "Dividend" chips inline.  Only articles whose
+    title or description matches at least one filing pattern are returned.
+    """
+    t = _time.monotonic()
+    companies = _parse_companies_csv(company)
+
+    # Pull a wider net than limit — we'll filter then trim
+    raw_articles, total_raw, sn = await query_articles_with_sentiment(
+        companies, sector, hours, page=1, limit=min(500, limit * 5),
+        apply_fuzzy_dedup=True, resolve_links=resolve_links,
+    )
+
+    # Filter to filing-events + tag each with detected categories
+    filings = []
+    requested_type = filing_type if filing_type and filing_type in FILING_CATEGORIES else None
+    for a in raw_articles:
+        text_blob = (a.get("title") or "") + ". " + (a.get("description") or "")
+        types = detect_filing_types(text_blob)
+        if not types:
+            continue
+        if requested_type and requested_type not in types:
+            continue
+        a["filing_types"] = types
+        filings.append(a)
+
+    # Paginate the filtered results
+    total = len(filings)
+    skip = (page - 1) * limit
+    page_slice = filings[skip:skip + limit]
+
+    age_min = None
+    if last_full_fetch:
+        age_min = int((datetime.now(timezone.utc) - last_full_fetch).total_seconds() / 60)
+
+    return {
+        "success": True,
+        "query": {
+            "company": companies, "sector": sector, "filing_type": requested_type,
+            "hours": hours, "page": page, "limit": limit,
+        },
+        "meta": {
+            "total_results": total,
+            "returned": len(page_slice),
+            "total_pages": max(1, (total + limit - 1) // limit),
+            "current_page": page,
+            "scanned_articles": len(raw_articles),
+            "response_time_ms": int((_time.monotonic() - t) * 1000),
+            "last_full_fetch_ist": last_full_fetch.astimezone(IST).strftime(
+                "%Y-%m-%d %H:%M:%S IST") if last_full_fetch else None,
+            "data_age_min": age_min,
+            "refresh_interval_min": FETCH_INTERVAL_MIN,
+            "data_source": "news_feeds",   # honest — not from NSE/BSE direct
+            "filing_categories_supported": FILING_CATEGORIES,
+            "note": "Filings are derived from news headlines (real-time coverage of material filings by ET/Mint/Moneycontrol etc.) — not from NSE/BSE direct.",
+        },
+        "filings": page_slice,
+    }
+
+
+@app.get("/filings/categories")
+async def list_filing_categories():
+    """Directory of supported filing-event categories (for UI dropdowns)."""
+    return {
+        "categories": FILING_CATEGORIES,
+        "patterns_summary": {
+            cat: FILING_PATTERNS[cat][:3] for cat in FILING_CATEGORIES
+        },
+    }
+
+
+# ═══════════════════════════════════════════════════
 # /health, /stats — operational
 # ═══════════════════════════════════════════════════
 @app.get("/health")
@@ -912,6 +1085,28 @@ MCP_TOOLS = [
             },
         },
     },
+    {
+        "name": "list_company_filings",
+        "description": (
+            "List recent corporate filings / announcements (results, annual "
+            "report, board meeting, dividend, AGM/EGM, M&A, IPO, etc.) for an "
+            "Indian-listed company.  Powered by news-feed coverage of material "
+            "filings — typically captured within minutes of the official filing."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "company": {"type": "string", "description": "Company name (or alias)"},
+                "filing_type": {
+                    "type": "string",
+                    "enum": FILING_CATEGORIES,
+                    "description": "Optional: filter to one filing category"
+                },
+                "hours": {"type": "integer", "default": 48, "minimum": 1, "maximum": 240},
+                "limit": {"type": "integer", "default": 20, "minimum": 1, "maximum": 100},
+            },
+        },
+    },
 ]
 
 
@@ -975,6 +1170,40 @@ async def _mcp_trending(args: dict) -> dict:
     )
 
 
+async def _mcp_filings(args: dict) -> dict:
+    res = await get_filings(
+        company=args.get("company"),
+        sector=args.get("sector"),
+        filing_type=args.get("filing_type"),
+        hours=int(args.get("hours", 48)),
+        page=1,
+        limit=int(args.get("limit", 20)),
+        resolve_links=True,
+    )
+    # Lean response for chat: drop description + heavy fields, keep the
+    # signal-rich bits the LLM uses for answer-shaping.
+    lean_filings = [
+        {
+            "title": f.get("title"),
+            "source": f.get("source"),
+            "published_ist": f.get("published_ist"),
+            "link": f.get("link"),
+            "companies": f.get("companies"),
+            "sector": f.get("sector"),
+            "filing_types": f.get("filing_types"),
+        }
+        for f in res.get("filings", [])
+    ]
+    return {
+        "company": args.get("company"),
+        "filing_type": args.get("filing_type"),
+        "total": res["meta"]["total_results"],
+        "returned": len(lean_filings),
+        "data_age_min": res["meta"]["data_age_min"],
+        "filings": lean_filings,
+    }
+
+
 @app.post("/mcp")
 async def mcp_call(request: Request):
     """
@@ -991,6 +1220,7 @@ async def mcp_call(request: Request):
         "search_financial_news": _mcp_search,
         "get_market_sentiment": _mcp_sentiment,
         "get_trending_stocks": _mcp_trending,
+        "list_company_filings": _mcp_filings,
     }
     handler = handlers.get(tool)
     if not handler:
