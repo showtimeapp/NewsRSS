@@ -165,23 +165,27 @@ def canonical_name(raw: str) -> str:
 
 
 def build_aliases(canonical: str, nse_symbol: str | None) -> list[str]:
-    """Heuristic alias generation: stripped name, full name, NSE symbol, short tokens."""
+    """
+    Conservative alias generation: only forms guaranteed to identify THIS company.
+    - Full name (lowercase)
+    - Same name without spaces
+    - "&" -> "and" variant
+    - NSE symbol (uppercase ticker; matched case-sensitively at runtime)
+
+    First-word heuristic was REMOVED — for "India Home Loan" it generated "india"
+    which then matched every article mentioning India.  For "Times Green Energy"
+    it generated "times" → matched every Times Of India byline.  Catastrophic
+    false-positive rate.  Short ALL-CAPS tickers are protected at match time by
+    the case-sensitive scan in company_aliases.detect_companies().
+    """
     if not canonical:
         return []
     aliases = set()
     aliases.add(canonical.lower())
-    # Without spaces
     aliases.add(canonical.lower().replace(" ", ""))
-    # Without "&" -> "and"
     aliases.add(canonical.lower().replace(" & ", " and "))
-    # First word only IF it's distinctive (>3 chars)
-    first = canonical.split()[0].lower()
-    if len(first) > 3:
-        aliases.add(first)
-    # NSE symbol
     if nse_symbol:
         aliases.add(nse_symbol.lower())
-    # Strip out empties + duplicates
     return sorted(a for a in aliases if a)
 
 

@@ -232,45 +232,86 @@ def _build_alias_lookup() -> dict:
 
 
 _ALIAS_LOOKUP = _build_alias_lookup()
-# Sort by length desc — match "hdfc bank" before "hdfc"
-_SORTED_ALIASES = sorted(_ALIAS_LOOKUP.keys(), key=len, reverse=True)
 
-# Precompiled regex for fast scan. Bound on word edges to avoid mid-word matches.
-# Chunked because Python's re has a group-count limit (~99 groups per alt).
-_REGEX_CHUNKS: list[re.Pattern] = []
-def _build_regex_chunks(aliases: list[str], chunk_size: int = 200) -> list[re.Pattern]:
+
+def _is_acronym_alias(alias: str) -> bool:
+    """
+    Short letters-only aliases (≤4 chars) like 'ioc', 'tcs', 'hdfc', 'bob'
+    are accidentally ambiguous in plain text — 'IOC' also means Initial
+    Operational Capability / Olympic Committee, 'BOB' is a common name, etc.
+    We force these to match ONLY when written in uppercase in the source text.
+    """
+    return 2 <= len(alias) <= 4 and alias.isalpha()
+
+
+# Split aliases into two buckets with different matching strategies.
+_ACRONYM_ALIASES = sorted(
+    {a for a in _ALIAS_LOOKUP if _is_acronym_alias(a)},
+    key=len, reverse=True,
+)
+_REGULAR_ALIASES = sorted(
+    {a for a in _ALIAS_LOOKUP if not _is_acronym_alias(a)},
+    key=len, reverse=True,
+)
+
+
+def _build_regex_chunks_ci(aliases: list[str], chunk_size: int = 200) -> list[re.Pattern]:
+    """Case-insensitive — for full names + multi-word aliases (the safe ones)."""
     pats = []
     for i in range(0, len(aliases), chunk_size):
         chunk = aliases[i:i + chunk_size]
-        # Escape, join, word-boundary-ish (allow alpha-num neighbors to block)
-        # Using \b doesn't work for things like 'l&t' so we use a custom boundary
         body = "|".join(re.escape(a) for a in chunk)
         pats.append(re.compile(rf"(?<![a-z0-9])({body})(?![a-z0-9])", re.IGNORECASE))
     return pats
 
-_REGEX_CHUNKS = _build_regex_chunks(_SORTED_ALIASES)
+
+def _build_regex_chunks_cs(aliases: list[str], chunk_size: int = 200) -> list[re.Pattern]:
+    """
+    Case-sensitive — short acronyms ONLY match when they appear ALL-UPPERCASE
+    in the source. Stops 'ioc' matching 'commission of inquiry (ioc)' etc.
+    """
+    pats = []
+    for i in range(0, len(aliases), chunk_size):
+        chunk = aliases[i:i + chunk_size]
+        body = "|".join(re.escape(a.upper()) for a in chunk)
+        # No re.IGNORECASE flag — must match uppercase. Boundary uses A-Z + 0-9.
+        pats.append(re.compile(rf"(?<![A-Z0-9])({body})(?![A-Z0-9])"))
+    return pats
+
+
+_REGEX_CHUNKS_CI = _build_regex_chunks_ci(_REGULAR_ALIASES)
+_REGEX_CHUNKS_CS = _build_regex_chunks_cs(_ACRONYM_ALIASES)
 
 
 def detect_companies(text: str) -> list:
-    """Return canonical company names mentioned in text (deduped, first-occurrence order)."""
+    """
+    Return canonical company names mentioned in text (deduped, first-occurrence
+    order). Long names match case-insensitively; short acronyms require uppercase.
+    """
     if not text:
         return []
-    t = " " + text.lower() + " "
-    found_order = []
-    seen = set()
-    # Scan with each chunk regex; collect by position
+    # Two scans on the same string. Positions align because text.lower() doesn't
+    # change indices (each char maps 1:1 with original).
+    t_lower = " " + text.lower() + " "
+    t_orig = " " + text + " "
+
     matches = []
-    for pat in _REGEX_CHUNKS:
-        for m in pat.finditer(t):
+    for pat in _REGEX_CHUNKS_CI:
+        for m in pat.finditer(t_lower):
             matches.append((m.start(), m.group(1).lower()))
+    for pat in _REGEX_CHUNKS_CS:
+        for m in pat.finditer(t_orig):
+            matches.append((m.start(), m.group(1).lower()))
+
     if not matches:
         return []
-    # Sort by position; for overlapping matches at the same start, longest wins
+    # Position-ordered, with longer alias winning on overlap.
     matches.sort(key=lambda x: (x[0], -len(x[1])))
-    used_spans = []  # list of (start, end) already consumed
+    found_order = []
+    seen = set()
+    used_spans = []
     for start, alias in matches:
         end = start + len(alias)
-        # Skip if overlaps an already-consumed span (longer alias already won)
         if any(s <= start < e or s < end <= e for s, e in used_spans):
             continue
         canon = _ALIAS_LOOKUP.get(alias)
