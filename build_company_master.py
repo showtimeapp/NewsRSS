@@ -164,29 +164,74 @@ def canonical_name(raw: str) -> str:
     return name
 
 
+# Generic words that must NEVER become an alias even if they came in as an
+# NSE symbol or a normalized name. These were the actual false-positive
+# sources in production: "global" -> Global Education, "focus" -> Focus Lighting,
+# "ipl" -> India Pesticides (cricket articles), "supreme" -> Supreme Holdings.
+_ALIAS_STOPWORDS = frozenset({
+    # common English nouns / adjectives
+    "india", "indian", "global", "focus", "supreme", "wealth", "first", "last",
+    "trade", "market", "markets", "times", "national", "bharat", "dollar", "world",
+    "new", "best", "value", "fortune", "power", "energy", "future", "modern",
+    "select", "central", "general", "universal", "premier", "elite", "vision",
+    "leader", "smart", "good", "great", "high", "low", "core", "prime", "north",
+    "south", "east", "west", "city", "state", "asia", "asian", "european",
+    "american", "online", "digital", "media", "news", "report", "service",
+    "services", "industries", "industry", "group", "company", "corporation",
+    "limited", "ventures", "products", "solutions", "systems", "holdings",
+    "international", "global", "indo", "indian", "education", "technologies",
+    # specific high-collision sports/political acronyms
+    "ipl", "icc", "bcci", "wpl", "isl", "dea", "fda", "rbi", "sebi", "nse", "bse",
+    # short alpha articles / fillers
+    "the", "and", "for", "with", "from", "this", "that", "its", "ltd",
+})
+
+
 def build_aliases(canonical: str, nse_symbol: str | None) -> list[str]:
     """
-    Conservative alias generation: only forms guaranteed to identify THIS company.
-    - Full name (lowercase)
-    - Same name without spaces
-    - "&" -> "and" variant
-    - NSE symbol (uppercase ticker; matched case-sensitively at runtime)
+    Strictest alias generation. Auto-master entries match ONLY by full name.
 
-    First-word heuristic was REMOVED — for "India Home Loan" it generated "india"
-    which then matched every article mentioning India.  For "Times Green Energy"
-    it generated "times" → matched every Times Of India byline.  Catastrophic
-    false-positive rate.  Short ALL-CAPS tickers are protected at match time by
-    the case-sensitive scan in company_aliases.detect_companies().
+    What's INCLUDED:
+        - canonical.lower()                              ("global education")
+        - canonical.lower().replace(" ", "")             ("globaleducation")
+        - canonical.lower().replace(" & ", " and ")      ("jindal steel and power")
+
+    What's EXPLICITLY EXCLUDED:
+        - NSE symbols.  These caused the worst false positives because lowercase
+          tickers collide with English words: "GLOBAL" -> "global", "FOCUS" ->
+          "focus", "WEALTH" -> "wealth", "IPL" -> matches every IPL cricket
+          headline.  Auto-master companies don't get short aliases at all.
+          (Curated 80 still have hand-vetted short aliases like "tcs", "hdfc".)
+        - Any alias in _ALIAS_STOPWORDS (common English words).
+
+    Trade-off accepted: auto-master companies are only found when the article
+    spells out the full name.  Coverage drops for the long tail, accuracy
+    climbs to near-100%.
     """
     if not canonical:
         return []
-    aliases = set()
-    aliases.add(canonical.lower())
-    aliases.add(canonical.lower().replace(" ", ""))
-    aliases.add(canonical.lower().replace(" & ", " and "))
-    if nse_symbol:
-        aliases.add(nse_symbol.lower())
-    return sorted(a for a in aliases if a)
+    full_lower = canonical.lower()
+    aliases = {
+        full_lower,
+        full_lower.replace(" ", ""),
+        full_lower.replace(" & ", " and "),
+    }
+    # For canonicals with 3+ words, also add the first-2-words prefix as an
+    # alias.  "Wardwizard Innovations & Mobility" -> add "wardwizard innovations"
+    # so news copy that drops the "& Mobility" still tags.  Stays distinctive
+    # because we require BOTH words; "global education" (2 words) gets no prefix.
+    words = full_lower.split()
+    if len(words) >= 3:
+        two_word_prefix = " ".join(words[:2])
+        # Only add if BOTH words are non-stopwords. "global education" prefix
+        # would still be blocked because "global" is stopword'd elsewhere.
+        if (two_word_prefix not in _ALIAS_STOPWORDS
+                and words[0] not in _ALIAS_STOPWORDS
+                and words[1] not in _ALIAS_STOPWORDS):
+            aliases.add(two_word_prefix)
+    # NSE symbol intentionally NOT added. Stopwords + empty strings filtered.
+    aliases = {a for a in aliases if a and a not in _ALIAS_STOPWORDS}
+    return sorted(aliases)
 
 
 def main():
