@@ -247,6 +247,73 @@ REFERER_MAP = {
 }
 
 
+# URL-path sector hints — when an article comes from a feed whose URL contains
+# one of these substrings, we use that as a high-confidence sector signal.
+# Examples that match:
+#   indianexpress.com/section/business/banking-and-finance/feed/    -> BANKING
+#   livemint.com/rss/insurance                                       -> BANKING
+#   thehindubusinessline.com/money-and-banking/feeder/default.rss   -> BANKING
+#   et.com/industry/banking/finance/rssfeeds/...                    -> BANKING
+#   et.com/tech/rssfeeds/...                                        -> TECH
+#   livemint.com/rss/technology                                     -> TECH
+#   et.com/markets/commodities/rssfeeds/...                         -> ENERGY (commodity proxy)
+# Returns None if no hint matched. detect_sector() uses this BEFORE its
+# keyword-fallback scan.
+URL_SECTOR_HINTS = (
+    # ── BANKING (incl. insurance + finance) ──
+    ("/banking-and-finance/", "BANKING"),
+    ("/banking/finance/",     "BANKING"),
+    ("/money-and-banking/",   "BANKING"),
+    ("/banking/",             "BANKING"),
+    ("/banks/",               "BANKING"),
+    ("/insurance",            "BANKING"),
+    ("/personal-finance",     "BANKING"),
+    ("/nbfc",                 "BANKING"),
+    ("/finance/",             "BANKING"),
+    # ── TECH ──
+    ("/technology",           "TECH"),
+    ("/tech/",                "TECH"),
+    ("/it/",                  "TECH"),
+    ("/software",             "TECH"),
+    # ── AUTO ──
+    ("/auto/",                "AUTO"),
+    ("/automobile",           "AUTO"),
+    ("/automotive",           "AUTO"),
+    # ── PHARMA / HEALTHCARE ──
+    ("/pharma",               "PHARMA"),
+    ("/healthcare",           "PHARMA"),
+    ("/health/",              "PHARMA"),
+    # ── ENERGY ──
+    ("/energy",               "ENERGY"),
+    ("/oil-and-gas",          "ENERGY"),
+    ("/power/",               "ENERGY"),
+    ("/commodities",          "ENERGY"),
+    # ── FMCG ──
+    ("/fmcg",                 "FMCG"),
+    ("/consumer",             "FMCG"),
+    # ── METALS ──
+    ("/metals",               "METALS"),
+    ("/steel",                "METALS"),
+    ("/mining",               "METALS"),
+    # ── REALTY ──
+    ("/real-estate",          "REALTY"),
+    ("/realty",               "REALTY"),
+    ("/property",             "REALTY"),
+    ("/housing",              "REALTY"),
+)
+
+
+def sector_hint_from_url(url: str) -> str | None:
+    """Return the sector chip (or None) implied by the feed URL path."""
+    if not url:
+        return None
+    url_l = url.lower()
+    for needle, sector in URL_SECTOR_HINTS:
+        if needle in url_l:
+            return sector
+    return None
+
+
 def _flatten(groups: list[dict]) -> list[tuple[str, str]]:
     result = []
     for group in groups:

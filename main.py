@@ -42,6 +42,7 @@ from feeds_config import (
     NEWS_FEEDS, NEWS_FEED_COUNT,
     FILINGS_FEEDS, FILINGS_FEED_COUNT,
     get_company_feeds, REFERER_MAP,
+    sector_hint_from_url,
 )
 from llm_provider import analyze_sentiment, active_provider
 from company_aliases import (
@@ -157,8 +158,15 @@ def parse_feed_bytes(raw_bytes, source_name, url, pipeline="news"):
 
     `pipeline` is stamped onto every emitted article ("news" or "filings"),
     so /filings can union the two streams cleanly downstream.
+
+    URL-path sector hint: feed URLs with /banking-and-finance/, /tech/, /auto/,
+    etc. emit a strong sector signal that wins over the keyword-fallback in
+    detect_sector(). E.g. articles from `indianexpress.com/section/business/
+    banking-and-finance/feed/` get sector="BANKING" even when the headline
+    doesn't contain a banking keyword.
     """
     is_google = "news.google.com" in url
+    url_sector = sector_hint_from_url(url)   # may be None
     feed = feedparser.parse(raw_bytes)
     articles = []
     now = datetime.now(timezone.utc)
@@ -187,7 +195,13 @@ def parse_feed_bytes(raw_bytes, source_name, url, pipeline="news"):
         # Company + sector enrichment from title+description
         text_blob = f"{title}. {description}"
         companies = detect_companies(text_blob)
+        # Sector resolution priority:
+        #   1. company → sector (via CURATED_SECTOR / SECTOR_BY_COMPANY map)
+        #   2. URL-path hint (e.g. /banking-and-finance/ → BANKING)
+        #   3. keyword-fallback in detect_sector()
         sector = detect_sector(text_blob, companies)
+        if not sector and url_sector:
+            sector = url_sector
 
         articles.append({
             "title": title,
