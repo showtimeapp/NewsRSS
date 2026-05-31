@@ -166,43 +166,8 @@ AGGREGATOR_FEEDS = {
     ],
 }
 
-# ═══════════════════════════════════════════════════════════════
-# OFFICIAL INDIAN FINANCIAL SOURCES — direct RSS
-# Each URL has been verified live (content recent within last week, schema
-# parsed cleanly by feedparser).  These are the gold-standard authentic feeds
-# for regulatory + central-bank news.
-# ═══════════════════════════════════════════════════════════════
-OFFICIAL_FEEDS = {
-    # ── RBI (Reserve Bank of India) — 4 official feeds ──
-    # https://www.rbi.org.in/Scripts/rss.aspx lists these directly.
-    "RBI Press Releases": ["https://rbi.org.in/pressreleases_rss.xml"],
-    "RBI Notifications":  ["https://rbi.org.in/notifications_rss.xml"],
-    "RBI Speeches":       ["https://rbi.org.in/speeches_rss.xml"],
-    "RBI Publications":   ["https://rbi.org.in/Publication_rss.xml"],
-
-    # ── SEBI (Securities and Exchange Board of India) ──
-    # Verified: 30 items, refreshed within last hour, enforcement orders +
-    # circulars + adjudication notices.
-    "SEBI": ["https://www.sebi.gov.in/sebirss.xml"],
-
-    # ── BSE (Bombay Stock Exchange) — market notices ──
-    # Verified: market schedule, mutual-fund availability, regulatory updates.
-    # Few items per day but very high signal.
-    "BSE Notices": ["https://www.bseindia.com/data/xml/notices.xml"],
-
-    # ── PIB Ministry of Finance press releases ──
-    # Standard PIB RSS pattern — needs browser User-Agent to bypass the basic
-    # bot filter; main.py's BROWSER_HEADERS already provides this. If this
-    # 403s in test_feeds.py, the live fetcher will still likely succeed.
-    "PIB Finance": [
-        "https://pib.gov.in/PressReleseRSSXmlMRSS.aspx?RegId=3&LangId=1",
-    ],
-
-    # NSE (National Stock Exchange) does NOT publish a public RSS — their
-    # corporate announcements are behind a session-authenticated API.
-    # Coverage via news aggregator: Google News for individual companies
-    # picks up NSE filings via secondary republication.
-}
+# NOTE: Official-source feeds (RBI / SEBI / BSE / PIB) have been moved to
+# a separate standalone project: `prism-filings`. NewsRSS is now news-only.
 
 # ── Global wire ────────────────────────────────────────────────
 GLOBAL_FEEDS = {
@@ -323,35 +288,16 @@ def _flatten(groups: list[dict]) -> list[tuple[str, str]]:
     return result
 
 
-# News-pipeline feeds — fetched every 10 min by the live scheduler.
 _NEWS_GROUPS = [
     ET_FEEDS, MC_FEEDS, MINT_FEEDS, NDTV_FEEDS, HINDU_FEEDS,
     CNBC_FEEDS, IE_FEEDS, TOI_FEEDS, BT_FEEDS, IT_FEEDS,
     NEWS18_FEEDS, OTHER_FEEDS, AGGREGATOR_FEEDS, GLOBAL_FEEDS,
 ]
 
-# Filings-pipeline feeds — fetched every 30 min by a separate scheduler.
-# These are official Indian regulator + exchange RSS endpoints (RBI, SEBI,
-# BSE notices, PIB Finance). Lower cadence is intentional:
-#   - regulator endpoints publish slowly (a few items/day)
-#   - we want to be polite to gov.in domains
-#   - filings news doesn't expire in 10 min the way market commentary does
-_FILINGS_GROUPS = [OFFICIAL_FEEDS]
-
 
 def get_all_feeds() -> list[tuple[str, str]]:
-    """All feeds across both pipelines — kept for back-compat / test_feeds.py."""
-    return _flatten(_NEWS_GROUPS + _FILINGS_GROUPS)
-
-
-def get_news_feeds() -> list[tuple[str, str]]:
-    """News pipeline feeds — fast cadence (every 10 min)."""
+    """All news feeds. Filings sources moved to the separate prism-filings project."""
     return _flatten(_NEWS_GROUPS)
-
-
-def get_filings_feeds() -> list[tuple[str, str]]:
-    """Filings pipeline feeds — slow cadence (every 30 min), official sources."""
-    return _flatten(_FILINGS_GROUPS)
 
 
 def get_company_feeds(company_name: str) -> list[tuple[str, str]]:
@@ -369,17 +315,11 @@ def get_company_feeds(company_name: str) -> list[tuple[str, str]]:
 
 
 ALL_FEEDS = get_all_feeds()
-NEWS_FEEDS = get_news_feeds()
-FILINGS_FEEDS = get_filings_feeds()
 FEED_COUNT = len(ALL_FEEDS)
-NEWS_FEED_COUNT = len(NEWS_FEEDS)
-FILINGS_FEED_COUNT = len(FILINGS_FEEDS)
 
 if __name__ == "__main__":
     gn = sum(1 for _, u in ALL_FEEDS if "news.google.com" in u)
     direct = FEED_COUNT - gn
     print(f"Total feeds: {FEED_COUNT}")
-    print(f"  News pipeline    (10 min cadence): {NEWS_FEED_COUNT}")
-    print(f"  Filings pipeline (30 min cadence): {FILINGS_FEED_COUNT}")
     print(f"  Direct RSS: {direct} | Google News: {gn}")
     print(f"  Target latency: ~3s per wave (chunked-wave fetcher)")

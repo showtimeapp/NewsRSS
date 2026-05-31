@@ -1,6 +1,8 @@
 # Prism Financial News API — Integration Guide
 
-FastAPI service that aggregates **80 RSS feeds** across two pipelines, tags articles by **company** + **sector** (4,149-company alias master), runs **OpenAI sentiment** lazily, and surfaces both general news AND structured corporate filings via REST + an **MCP endpoint** for Claude / agent tool integration.
+FastAPI service that aggregates **73 RSS feeds** of Indian financial news, tags articles by **company** + **sector** (4,149-company alias master), runs **OpenAI sentiment** lazily, and exposes the data via REST + an **MCP endpoint** for Claude / agent tool integration.
+
+> **Note:** Corporate-filings coverage (NSE / BSE / SEBI / RBI / PIB direct RSS) is now a **separate standalone service**: `prism-filings`. This repo is news-only.
 
 **Base URL (prod):** `http://<gcp-server>:8001`
 **Swagger UI:** `http://<gcp-server>:8001/docs`
@@ -11,29 +13,29 @@ FastAPI service that aggregates **80 RSS feeds** across two pipelines, tags arti
 ## Architecture at a glance
 
 ```
-┌── 10 min ──┐         ┌── 30 min ──┐
-│ NEWS       │         │ FILINGS    │
-│ scheduler  │         │ scheduler  │
-│ 73 feeds   │         │ 7 feeds    │
-│ (ET, Mint, │         │ (RBI x4,   │
-│  MC, CNBC, │         │  SEBI,     │
-│  Google,   │         │  BSE notices│
-│  Bloomberg,│         │  PIB MoF)  │
-│  ...)      │         │            │
-│ pipeline=  │         │ pipeline=  │
-│  "news"    │         │  "filings" │
-└─────┬──────┘         └─────┬──────┘
-      │                      │
-      ▼                      ▼
+┌── 10 min ──┐
+│ NEWS       │
+│ scheduler  │
+│ 73 feeds   │
+│ (ET, Mint, │
+│  MC via    │
+│  Google,   │
+│  CNBC,     │
+│  Bloomberg,│
+│  ...)      │
+└─────┬──────┘
+      │
+      ▼
   ┌──────────────────────────────────┐
   │ MongoDB articles collection      │
-  │   (pipeline field distinguishes) │
   └──────┬──────────────────┬────────┘
          │                  │
     ┌────┴────┐         ┌───┴────┐
     ▼         ▼         ▼        ▼
- /news    /news/...  /filings  /mcp (4 tools)
+ /news    /news/...    /mcp (3 tools)
 ```
+
+**Corporate filings** (results / dividends / board meetings / AGM/EGM / M&A / IPOs from NSE / BSE / SEBI / RBI / PIB) → see the **`prism-filings`** service (separate repo + own MongoDB + own /mcp).
 
 ---
 
@@ -72,7 +74,6 @@ Response shape:
       "original_link": "https://news.google.com/...",
       "companies": ["HDFC Bank"],
       "sector": "BANKING",
-      "pipeline": "news",                       // ← which scheduler ingested
       "sentiment": {"label": "positive", "score": 0.81, "provider": "openai"}
     }
   ]
@@ -95,74 +96,7 @@ Response shape:
 - `?company=X` does fire a small per-company Google News fetch (3 URLs) for that ticker → ~1s extra latency, fresher data for that specific name.
 - `sentiment` is `null` on most articles — populated only on company-specific queries.
 
-### 2. NEW — Corporate filings (`/filings`)
-
-Real-time material filings — Q4 results, dividends, board meetings, AGM/EGM, M&A, IPOs — surfaced from both pipelines:
-
-```http
-GET /filings?company=Reliance&filing_type=Result&hours=48&limit=20
-GET /filings?sector=BANKING&filing_type=Board%20Meeting&hours=72
-GET /filings?hours=24                                                  # all recent filings
-```
-
-Response:
-```json
-{
-  "meta": {
-    "total_results": 28, "returned": 20,
-    "scanned_articles": 142,
-    "news_pipeline":    {"age_min": 4,  "refresh_interval_min": 10},
-    "filings_pipeline": {"age_min": 18, "refresh_interval_min": 30},
-    "data_sources": ["news_feeds", "official (RBI/SEBI/BSE/PIB)"],
-    "filing_categories_supported": ["Result","Annual Report","Board Meeting",
-      "AGM/EGM","Corp Action","Insider Trading","M&A","IPO","Listing",
-      "Allotment","Guidance","Rating/Target","Official"]
-  },
-  "filings": [
-    {
-      "title": "Reliance Industries to consider buyback proposal at board meeting June 5",
-      "source": "Economic Times",
-      "published_ist": "2026-05-31 13:30:00 IST",
-      "link": "...",
-      "companies": ["Reliance Industries"],
-      "sector": "ENERGY",
-      "pipeline": "news",
-      "filing_types": ["Board Meeting", "Corp Action"]    // ← multiple categories
-    },
-    {
-      "title": "RBI penalises CreditAccess Grameen for regulatory non-compliance",
-      "source": "RBI Press Releases",
-      "pipeline": "filings",
-      "filing_types": ["Official"]                          // ← from regulator direct
-    }
-  ]
-}
-```
-
-**The 12 filing categories detected via keyword regex:**
-
-| Category | Triggers on |
-|---|---|
-| `Result` | Q1/Q2/Q3/Q4, quarterly results, earnings, net profit, PAT, EBITDA |
-| `Annual Report` | annual report, FYxx annual |
-| `Board Meeting` | board meeting, board approves/considers/recommends |
-| `AGM/EGM` | AGM, EGM, annual general meeting |
-| `Corp Action` | dividend, bonus, stock split, buyback, rights issue |
-| `Insider Trading` | insider trading, SAST, promoter stake |
-| `M&A` | merger, acquisition, takeover, divestment, demerger |
-| `IPO` | IPO, FPO, QIP, DRHP, RHP, oversubscribed |
-| `Listing` | listed on, delisted, new listing, listing gains |
-| `Allotment` | allotment, preferential issue, equity allotment |
-| `Guidance` | guidance, outlook, forecast, management commentary |
-| `Rating/Target` | target price, upgrade/downgrade to buy/sell, rating raised |
-| `Official` | (prefix) — article came from RBI/SEBI/BSE/PIB direct |
-
-Companion directory endpoint:
-```http
-GET /filings/categories  → {"categories": [...], "patterns_summary": {...}}
-```
-
-### 3. Per-company summary card
+### 2. Per-company summary card
 
 ```http
 GET /news/summary?company=HDFC%20Bank&hours=24
@@ -180,7 +114,7 @@ GET /news/summary?company=HDFC%20Bank&hours=24
 
 First call: 5–10s (OpenAI analyzes fresh articles). Subsequent calls: sub-second (cached).
 
-### 4. Trending companies sidebar
+### 3. Trending companies sidebar
 
 ```http
 GET /news/trending?hours=24&limit=10
@@ -196,7 +130,7 @@ GET /news/trending?hours=24&limit=10
 }
 ```
 
-### 5. Multi-company comparison
+### 4. Multi-company comparison
 
 ```http
 GET /news/compare?companies=HDFC,ICICI,SBI&hours=48
@@ -204,21 +138,20 @@ GET /news/compare?companies=HDFC,ICICI,SBI&hours=48
 
 Returns each company's summary side-by-side, ranked by `avg_score`.
 
-### 6. Source reliability strip
+### 5. Source reliability strip
 
 ```http
 GET /news/sources?hours=24
 ```
 
-### 7. Directory endpoints (for dropdowns)
+### 6. Directory endpoints (for dropdowns)
 
 ```http
 GET /news/companies   → {"total": 4149, "companies": [...]}
 GET /news/sectors     → {"sectors": ["BANKING","TECH","AUTO","PHARMA","ENERGY","FMCG","METALS","REALTY"]}
-GET /filings/categories → {"categories": [...], "patterns_summary": {...}}
 ```
 
-### 8. Health
+### 7. Health
 
 ```http
 GET /health
@@ -231,16 +164,10 @@ GET /health
   "total_articles": 215000,
   "articles_with_sentiment": 8400,
   "articles_with_companies_tagged": 150000,
-  "articles_from_filings_pipeline": 47,
   "last_24h": 5100, "last_1h": 80,
   "sources_active": 220,
-  "feeds_total": 80,
-  "feeds_news_pipeline": 73,
-  "feeds_filings_pipeline": 7,
-  "last_news_fetch":     "2026-05-31 14:18:33 IST",
-  "last_filings_fetch":  "2026-05-31 14:00:12 IST",
-  "news_interval_min":     10,
-  "filings_interval_min":  30
+  "feeds": 73,
+  "last_fetch": "2026-05-31 14:18:33 IST"
 }
 ```
 
@@ -257,7 +184,6 @@ GET /health
 | Headline list rows | `articles[1..N]` — `companies[0]` as ticker prefix, `source` as small caps |
 | `ROUTED TO` cards | Top 3 sectors from `articles[]` grouped by `.sector` |
 | `Trending now` sidebar | `GET /news/trending` |
-| **NEW filing-event panel** | `GET /filings?hours=24&limit=20` — render `filing_types` as chips |
 | Volume sparkline | 20 buckets × 3 min from `articles[].published_ist` |
 | `HEADLINES TODAY` stat | `meta.total_results` from `/news?hours=24` |
 | Bottom ticker | `articles[].title` joined, marquee-scrolled |
@@ -278,12 +204,11 @@ GET /mcp
 ```json
 {
   "protocol": "mcp", "version": "2024-11-05",
-  "server": {"name": "prism-news", "version": "5.1.0"},
+  "server": {"name": "prism-news", "version": "5.2.0"},
   "tools": [
     {"name": "search_financial_news",  "description": "...", "inputSchema": {...}},
     {"name": "get_market_sentiment",   "description": "...", "inputSchema": {...}},
-    {"name": "get_trending_stocks",    "description": "...", "inputSchema": {...}},
-    {"name": "list_company_filings",   "description": "...", "inputSchema": {...}}    // NEW
+    {"name": "get_trending_stocks",    "description": "...", "inputSchema": {...}}
   ]
 }
 ```
@@ -294,17 +219,18 @@ GET /mcp
 POST /mcp
 Content-Type: application/json
 
-{"tool": "list_company_filings", "arguments": {"company": "Reliance", "filing_type": "Result", "hours": 48}}
+{"tool": "get_market_sentiment", "arguments": {"company": "HDFC Bank", "hours": 24}}
 ```
 
-### The 4 tools
+### The 3 tools
 
 | Tool | Use when | Returns |
 |---|---|---|
 | `search_financial_news` | "Show me banking news" / "What's the news on Wipro?" | article list + sentiment per item |
 | `get_market_sentiment` | "How is HDFC Bank doing today?" | `{verdict, confidence, breakdown, top_positive, top_negative}` |
 | `get_trending_stocks` | "What's hot right now?" | top N companies + aggregate sentiment |
-| **`list_company_filings`** | "What did Reliance file last week?" / "Q4 results from any pharma stock today?" | filing-event list with `filing_types: [...]` |
+
+For corporate **filings** (results / dividends / board meetings / etc.) → call the **`prism-filings`** MCP server (separate `/mcp` endpoint at its own base URL).
 
 ### Drop into Claude Desktop / Claude Code
 
@@ -325,7 +251,7 @@ A pre-written **Claude Code skill** (`prism-news.skill.md`) is included in the r
 
 ---
 
-## Data shapes you'll get in articles / filings
+## Data shapes you'll get in articles
 
 ### `sentiment` (when populated; `null` otherwise)
 
@@ -351,14 +277,6 @@ One of 8 codes: `BANKING | TECH | AUTO | PHARMA | ENERGY | FMCG | METALS | REALT
 3. **Keyword fallback** — text scan against 8 sector keyword lists
 
 After this layering, ~80% of articles get a sector tag.
-
-### `pipeline` (new in v5.1)
-
-Either `"news"` or `"filings"`. Tells you which scheduler ingested the article. Filing-pipeline articles come from RBI/SEBI/BSE/PIB direct.
-
-### `filing_types` (only in `/filings` responses)
-
-Array of detected filing categories. Articles from `pipeline: "filings"` always have `"Official"` as the first element.
 
 ### Fine-grained industry / ISIN / NSE symbol
 
@@ -423,20 +341,20 @@ docker compose exec newsapi python load_backup.py --retag-only --batch 2000
 - **Pagination**: prefer increasing `limit` over walking `page`.
 - **Fuzzy dedup is on by default** — turn off with `?fuzzy=false` only if you want every near-duplicate (rare).
 - **`hours=24` is cheapest** because of warm index. `hours=168` works but slower.
-- **Refresh cadence**: back-end re-fetches every 10 min (news) / 30 min (filings). Polling `/news` from the UI every 30s is fine — DB cache hits.
+- **Refresh cadence**: back-end re-fetches every 10 min. Polling `/news` from the UI every 30s is fine — DB cache hits.
 - **Hindi articles are filtered at ingest** — Devanagari titles never enter the DB.
 
 ## Practical notes for the chat-system dev
 
-- **Use MCP, not raw REST** — the 4 MCP tools cover 90%+ of chat use cases.
+- **Use MCP, not raw REST** — the 3 MCP tools cover 90%+ of chat use cases.
 - **First-call OpenAI latency is real** — `get_market_sentiment` on a never-queried company takes 5–10s. Subsequent calls are sub-second.
 - **When to use which tool:**
   - User asks about a specific stock → `get_market_sentiment`
   - User asks what's moving / trending → `get_trending_stocks`
   - User asks for a list of articles → `search_financial_news`
-  - **User asks about filings / results / dividends / board meetings → `list_company_filings`**
+- **User asks about corporate filings (results / dividends / board meetings)** → route to the `prism-filings` MCP server (separate service).
 - **The skill file (`prism-news.skill.md`)** has decision rules + answer-shaping templates.
-- **`sentiment` is `null`** in `search_financial_news` and `list_company_filings` results unless the article was previously seen via a company-specific query. Don't claim a verdict if sentiment is null.
+- **`sentiment` is `null`** in `search_financial_news` results unless the article was previously seen via a company-specific query. Don't claim a verdict if sentiment is null.
 
 ---
 
@@ -445,7 +363,7 @@ docker compose exec newsapi python load_backup.py --retag-only --batch 2000
 | Endpoint | Purpose |
 |---|---|
 | `GET /` | API info |
-| `GET /health` | ops status — both pipelines |
+| `GET /health` | ops status |
 | `GET /stats` | last-24h rollups |
 | `GET /news` | main feed; `company`, `sector`, `hours`, `page`, `limit`, `fuzzy` |
 | `GET /news/summary` | per-company sentiment + trend |
@@ -454,9 +372,7 @@ docker compose exec newsapi python load_backup.py --retag-only --batch 2000
 | `GET /news/compare` | multi-company side-by-side |
 | `GET /news/companies` | 4,149-company directory |
 | `GET /news/sectors` | 8 sector codes |
-| **`GET /filings`** | **filing-event view (Q4 results, dividends, etc.)** |
-| **`GET /filings/categories`** | **12 filing categories + Official** |
-| `GET /mcp` | tool discovery (4 tools) |
+| `GET /mcp` | tool discovery (3 tools) |
 | `POST /mcp` | invoke tool by name |
 | `GET /docs` | Swagger UI |
 | `GET /openapi.json` | full OpenAPI 3.0 spec |
@@ -467,8 +383,8 @@ docker compose exec newsapi python load_backup.py --retag-only --batch 2000
 
 | File | Purpose |
 |---|---|
-| `main.py` | FastAPI app, both schedulers (news 10min + filings 30min), all endpoints |
-| `feeds_config.py` | 80 RSS feeds split into NEWS_FEEDS (73) + FILINGS_FEEDS (7) + URL_SECTOR_HINTS |
+| `main.py` | FastAPI app, scheduler (10 min), all endpoints |
+| `feeds_config.py` | 73 news RSS feeds + URL_SECTOR_HINTS |
 | `llm_provider.py` | OpenAI sentiment client + heuristic fallback chain |
 | `company_aliases.py` | curated 80 + auto-loaded master (4,149 names), 5-layer defense against false positives, helpers `get_industry`/`get_isin`/`get_nse_symbol` |
 | `company_master.json` | bundled 1.3MB data file |
@@ -497,10 +413,8 @@ docker compose logs -f newsapi
 Expected first-fetch logs:
 
 ```
-=== NEWS FETCH: 73 feeds ===
-=== NEWS DONE: 15 new in 95s ===          (every 10 min)
-=== FILINGS FETCH: 7 feeds ===
-=== FILINGS DONE: 2 new in 8s ===         (every 30 min)
+=== FULL FETCH: 73 feeds ===
+=== DONE: 15 new in 95s ===          (every 10 min)
 ```
 
 ### Re-tag after taxonomy / sector-mapping changes
@@ -519,13 +433,12 @@ docker compose exec mongodb mongosh -u newsadmin -p "$MONGO_PASSWORD" \
 ### Watch feed-fetch health
 
 ```bash
-docker compose logs -f newsapi 2>&1 | grep --line-buffered -E "NEWS FETCH|NEWS DONE|FILINGS FETCH|FILINGS DONE|feed timeout|feed http|feed error"
+docker compose logs -f newsapi 2>&1 | grep --line-buffered -E "FULL FETCH|DONE|feed timeout|feed http|feed error"
 ```
 
 Steady-state expectations:
-- Every 10 min: news fetch lands 65–75 of 73 feeds in ~95s, ~10-30 new docs
-- Every 30 min: filings fetch lands 5–7 of 7 feeds in ~10s, ~2-15 new docs
-- `Fetched X articles from Y/N feeds (9 waves × 10)` — the chunked-wave fetcher
+- Every 10 min: fetch lands 65–75 of 73 feeds in ~95s, ~10-30 new docs
+- `Fetched X articles from Y/73 feeds (8 waves × 10)` — the chunked-wave fetcher
 
 ### Required env in `.env`
 
@@ -544,14 +457,13 @@ Steady-state expectations:
 ### Tuning knobs (top of `main.py`)
 
 ```python
-FETCH_INTERVAL_MIN          = 10    # news scheduler cadence
-FILINGS_FETCH_INTERVAL_MIN  = 30    # filings scheduler cadence
+FETCH_INTERVAL_MIN = 10    # scheduler cadence
 MIN_FETCH_GAP_MIN  = 5
-FEED_TIMEOUT_SEC   = 12             # per-feed HTTP cap
-MAX_CONCURRENT     = 30             # TCPConnector total simultaneous connections
-MAX_PER_HOST       = 3              # TCPConnector per-host cap
-CHUNK_SIZE         = 10             # feeds per wave inside fetch_parallel
-CHUNK_PAUSE_SEC    = 3              # gap between waves; smooths outbound load
+FEED_TIMEOUT_SEC   = 12    # per-feed HTTP cap
+MAX_CONCURRENT     = 30    # TCPConnector total simultaneous connections
+MAX_PER_HOST       = 3     # TCPConnector per-host cap
+CHUNK_SIZE         = 10    # feeds per wave inside fetch_parallel
+CHUNK_PAUSE_SEC    = 3     # gap between waves; smooths outbound load
 ```
 
 If success rate drops, try `CHUNK_SIZE=5, CHUNK_PAUSE_SEC=5` for an even gentler profile.
@@ -571,5 +483,5 @@ git reset --hard <prev-sha> && docker compose up -d --build newsapi
 - **Caching layer** — fronting with CDN/Redis? Most responses are already <200ms from Mongo cache.
 - **Custom companies** — add a private/unlisted company → one-line edit in `CURATED_ALIASES` of `company_aliases.py` + retag.
 - **Custom sector** — edit `SECTORS` + `CURATED_SECTOR` + `URL_SECTOR_HINTS` + `PRISM_SECTOR_BY_INDUSTRY` in `build_company_master.py`, rebuild master, retag.
-- **Custom filing category** — extend `FILING_PATTERNS` in `main.py` (regex per category).
+- **Custom filing category** — handled by the `prism-filings` service (separate repo).
 - **Sentiment freshness** — if you need *all* articles sentiment-scored at ingest (not lazy), one-line change in `parse_feed_bytes` but adds OpenAI cost (~$0.0002 per article × 5k articles/day = ~$1/day).
