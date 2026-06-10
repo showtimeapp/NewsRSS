@@ -76,6 +76,16 @@ last_full_fetch: Optional[datetime] = None
 fetch_lock = asyncio.Lock()
 scheduler = AsyncIOScheduler()
 
+# ─── Background-task infrastructure ─────────────────────────────
+# /news?company=X used to BLOCK on per-company Google News fetch + OpenAI
+# sentiment (5-15s click latency). Now those run as background tasks AFTER
+# the DB response is sent. _background_tasks keeps a strong reference so
+# the GC doesn't reap mid-flight; _inflight_company_fetches dedups so
+# rapid-fire user clicks don't fire the same Google query 5 times in 10s.
+_background_tasks: set = set()
+_inflight_company_fetches: dict = {}   # canonical -> last started monotonic()
+_INFLIGHT_DEDUP_SEC = 60               # don't refetch same company within 60s
+
 BROWSER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
@@ -337,6 +347,104 @@ async def store_articles(articles):
     return ins
 
 
+def _spawn_background(coro):
+    """Fire-and-forget asyncio task with strong reference so GC doesn't reap it."""
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
+
+async def _bg_fetch_company_feeds(companies: list[str]):
+    """
+    Background work after /news?company=X returns:
+      1. Per-company Google News fetch (3 URLs/company)
+      2. Store new articles
+      3. Run OpenAI sentiment on any newly-fetched articles
+    Dedup via _inflight_company_fetches — same company can't run twice in 60s.
+    """
+    now = _time.monotonic()
+    fresh = []
+    for c in companies:
+        canon = normalize_company(c) or c
+        last = _inflight_company_fetches.get(canon, 0)
+        if now - last < _INFLIGHT_DEDUP_SEC:
+            continue
+        _inflight_company_fetches[canon] = now
+        fresh.append(c)
+    if not fresh:
+        return
+    try:
+        feeds = []
+        for c in fresh:
+            feeds.extend(get_company_feeds(c))
+        arts = await fetch_parallel(feeds, http_session)
+        ins = await store_articles(arts)
+        log.info(f"bg: per-company fetch for {fresh} added {ins} new")
+        # Kick a sentiment pass on the just-stored articles
+        if ins:
+            await _bg_run_sentiment_for_companies(fresh)
+    except Exception as e:
+        log.warning(f"bg fetch failed for {fresh}: {e}")
+
+
+async def _bg_run_sentiment_for_companies(companies: list[str]):
+    """
+    Background sentiment pass: take up to 30 most-recent articles for the
+    given companies that don't yet have sentiment, run OpenAI, persist.
+    """
+    if not companies or db is None:
+        return
+    try:
+        coll = db[COLLECTION]
+        canonical = [normalize_company(c) or c for c in companies]
+        cursor = coll.find(
+            {"companies": {"$in": canonical}, "sentiment": None},
+            {"title": 1, "_id": 1},
+        ).sort([("published_dt", -1)]).limit(30)
+        docs = [d async for d in cursor]
+        if not docs:
+            return
+        titles = [d.get("title", "")[:200] for d in docs]
+        sentiments = await asyncio.gather(*[analyze_one_title(t) for t in titles])
+        n = 0
+        for d, s in zip(docs, sentiments):
+            if s:
+                await coll.update_one({"_id": d["_id"]}, {"$set": {"sentiment": s}})
+                n += 1
+        log.info(f"bg: sentiment for {companies} analyzed {n}/{len(docs)} articles")
+    except Exception as e:
+        log.warning(f"bg sentiment failed for {companies}: {e}")
+
+
+async def _bg_resolve_links(article_ids: list):
+    """Background: resolve google.com news redirects + persist `original_link`."""
+    if not article_ids or not http_session or db is None:
+        return
+    try:
+        coll = db[COLLECTION]
+        cursor = coll.find(
+            {"_id": {"$in": article_ids}, "link": {"$regex": "news\\.google\\.com"}},
+            {"_id": 1, "link": 1},
+        )
+        targets = [d async for d in cursor]
+        if not targets:
+            return
+        tasks = [resolve_google_url(http_session, t["link"]) for t in targets]
+        resolved = await asyncio.gather(*tasks, return_exceptions=True)
+        n = 0
+        for t, r in zip(targets, resolved):
+            if isinstance(r, str) and r and r != t["link"]:
+                await coll.update_one(
+                    {"_id": t["_id"]},
+                    {"$set": {"original_link": t["link"], "link": r}},
+                )
+                n += 1
+        log.info(f"bg: resolved {n}/{len(targets)} google news links")
+    except Exception as e:
+        log.warning(f"bg link resolution failed: {e}")
+
+
 async def _resolve_google_links(articles: list, cap: int = 20) -> None:
     """In-place: resolve up to `cap` Google News URLs concurrently."""
     targets = [a for a in articles if is_google_news_url(a.get("link", ""))][:cap]
@@ -358,6 +466,8 @@ async def query_articles_with_sentiment(
     limit=50,
     apply_fuzzy_dedup: bool = True,
     resolve_links: bool = True,
+    run_sentiment: bool = True,        # /news passes False (background-kicks instead)
+    keep_id: bool = False,             # caller needs Mongo _id (for background tasks)
 ):
     coll = db[COLLECTION]
     q = {"published_dt": {"$gte": datetime.now(timezone.utc) - timedelta(hours=hours), "$ne": None}}
@@ -395,7 +505,7 @@ async def query_articles_with_sentiment(
         articles = fuzzy_dedup(articles)[:limit]
 
     sentiment_count = 0
-    if companies and articles:
+    if run_sentiment and companies and articles:
         need_sentiment = [doc for doc in articles if doc.get("sentiment") is None]
         if need_sentiment:
             titles = [doc.get("title", "")[:200] for doc in need_sentiment]
@@ -416,7 +526,8 @@ async def query_articles_with_sentiment(
 
     cleaned = []
     for doc in articles:
-        doc.pop("_id", None)
+        if not keep_id:
+            doc.pop("_id", None)
         doc.pop("title_key", None)
         if not companies and doc.get("sentiment") is None:
             doc.pop("sentiment", None)
@@ -487,6 +598,17 @@ async def lifespan(app: FastAPI):
     log.info(f"24/7 scheduler: every {FETCH_INTERVAL_MIN}m")
     yield
     scheduler.shutdown(wait=False)
+    # Give background tasks a bounded chance to finish so we don't lose
+    # in-flight DB writes on container restart.
+    if _background_tasks:
+        log.info(f"waiting for {len(_background_tasks)} background task(s) to finish (max 5s)...")
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*list(_background_tasks), return_exceptions=True),
+                timeout=5.0,
+            )
+        except asyncio.TimeoutError:
+            log.warning(f"shutdown: {len(_background_tasks)} background task(s) still running, abandoning")
     await http_session.close()
     client.close()
 
@@ -558,37 +680,63 @@ async def get_news(
     limit: int = Query(50, ge=1, le=500),
     resolve_links: bool = Query(True, description="Resolve google.news redirects"),
     fuzzy: bool = Query(True, description="Collapse near-duplicate titles"),
+    fresh: bool = Query(False, description="If true, block on per-company fetch instead of background-kicking (slower)"),
 ):
     """
-    Feed query.
+    Feed query — DB-only by default, background-refresh on company clicks.
 
-    - WITHOUT `company`: pure DB query, instant.
-    - WITH `company`: also fetches the 3 per-company Google News feeds so the
-      response includes the very latest headlines for that ticker.
+    Latency budget:
+      - without `company`:        ~50-100 ms (pure DB read)
+      - with `company`:           ~100-300 ms (pure DB read, refresh kicks behind)
+      - with `company&fresh=true`: 5-15 s     (blocks on Google fetch + OpenAI)
 
-    The full 81-feed catalog is refreshed ONLY by the 10-min background
-    scheduler — searches never trigger a full fetch (avoids the outbound
-    thundering-herd that crushed feed success rate).
+    When `company` is set we ALSO spawn TWO background tasks:
+      1. Per-company Google News fetch (3 URLs) + store new articles
+      2. OpenAI sentiment pass on articles missing it
+    Both are deduped via _inflight_company_fetches so rapid clicks on the
+    same company don't multiply the upstream work.
     """
     t = _time.monotonic()
-    stale = needs_full()
-    cn, fn, sn = 0, 0, 0
     companies = _parse_companies_csv(company)
 
-    if companies:
-        # Targeted per-company fetch only (3 Google News queries per company —
-        # cheap, doesn't stampede unrelated publishers).
+    # 1. Serve from DB immediately — no inline fetch, no inline OpenAI
+    articles, total, sn = await query_articles_with_sentiment(
+        companies, sector, hours, page, limit,
+        apply_fuzzy_dedup=fuzzy,
+        resolve_links=(resolve_links and fresh),  # only block on resolution if user asked
+        run_sentiment=fresh,                       # only block on OpenAI if user asked
+        keep_id=True,                              # need _id for the bg link resolver
+    )
+
+    cn = 0
+    if companies and fresh:
+        # User explicitly asked to block on fresh data — keep old behavior
         all_company_feeds = []
         for c in companies:
             all_company_feeds.extend(get_company_feeds(c))
         ca = await fetch_parallel(all_company_feeds, http_session)
         cn = await store_articles(ca)
+        # Re-query with fresh data + sentiment
+        articles, total, sn = await query_articles_with_sentiment(
+            companies, sector, hours, page, limit,
+            apply_fuzzy_dedup=fuzzy, resolve_links=resolve_links, run_sentiment=True,
+        )
 
-    articles, total, sn = await query_articles_with_sentiment(
-        companies, sector, hours, page, limit,
-        apply_fuzzy_dedup=fuzzy, resolve_links=resolve_links,
-    )
     elapsed = _time.monotonic() - t
+
+    # 2. Kick background work for next-user's-request freshness (only if not already fresh)
+    if companies and not fresh:
+        _spawn_background(_bg_fetch_company_feeds(companies))
+        _spawn_background(_bg_run_sentiment_for_companies(companies))
+
+    # 3. Background-resolve google.news links for the served articles
+    if not fresh and resolve_links:
+        google_ids = [
+            a.get("_id") for a in articles
+            if a.get("link") and "news.google.com" in a["link"] and a.get("_id")
+        ][:15]
+        if google_ids:
+            _spawn_background(_bg_resolve_links(google_ids))
 
     # How fresh is the data the user is seeing?
     age_min = None
@@ -596,16 +744,23 @@ async def get_news(
         age_min = int((datetime.now(timezone.utc) - last_full_fetch).total_seconds() / 60)
 
     # cache_status semantics:
-    #   "stale -> fetched"   user-search triggered a per-company fetch and we have fresh data
-    #   "fresh -> DB only"   DB was fresh enough; no fetch happened on this request
-    if companies:
-        cache_status = "stale -> fetched" if stale else "fresh -> DB only"
+    #   "fresh -> fetched inline" user passed ?fresh=true and we ran inline
+    #   "db_only + bg_refresh"    standard fast path; updates streaming in background
+    #   "fresh -> DB only"        no company filter; pure DB
+    if companies and fresh:
+        cache_status = "fresh -> fetched inline"
+    elif companies:
+        cache_status = "db_only + bg_refresh"
     else:
         cache_status = "fresh -> DB only"
 
+    # Strip Mongo _id (was kept for bg_resolve_links lookup)
+    for a in articles:
+        a.pop("_id", None)
+
     return {
         "success": True,
-        "query": {"company": companies, "sector": sector, "hours": hours, "page": page, "limit": limit},
+        "query": {"company": companies, "sector": sector, "hours": hours, "page": page, "limit": limit, "fresh": fresh},
         "meta": {
             "total_results": total,
             "returned": len(articles),
@@ -617,10 +772,11 @@ async def get_news(
                 "%Y-%m-%d %H:%M:%S IST") if last_full_fetch else None,
             "data_age_min": age_min,
             "refresh_interval_min": FETCH_INTERVAL_MIN,
-            "new_articles": {"company_search": cn, "full_fetch": fn},
+            "new_articles": {"company_search": cn, "full_fetch": 0},
             "sentiment_analyzed_this_request": sn,
             "sentiment_provider": active_provider(),
             "cache_status": cache_status,
+            "background_tasks": len(_background_tasks),
         },
         "articles": articles,
     }
